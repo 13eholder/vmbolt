@@ -6,7 +6,7 @@ toolchain go1.23.12
 
 require (
 	github.com/spf13/cobra v1.8.1
-	github.com/spf13/pflag v1.0.6
+	github.com/spf13/pflag v1.0.10
 	github.com/stretchr/testify v1.10.0
 	go.etcd.io/gofail v0.2.0
 	golang.org/x/sync v0.10.0
