@@ -1,7 +1,7 @@
 package freelist
 
 import (
-	"go.etcd.io/bbolt/internal/common"
+	"13eholder/vmbolt/internal/common"
 )
 
 type ReadWriter interface {

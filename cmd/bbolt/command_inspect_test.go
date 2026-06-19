@@ -5,9 +5,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	bolt "go.etcd.io/bbolt"
-	main "go.etcd.io/bbolt/cmd/bbolt"
-	"go.etcd.io/bbolt/internal/btesting"
+	bolt "13eholder/vmbolt"
+	main "13eholder/vmbolt/cmd/bbolt"
+	"13eholder/vmbolt/internal/btesting"
 )
 
 func TestInspect(t *testing.T) {

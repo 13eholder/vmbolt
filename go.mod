@@ -1,4 +1,4 @@
-module go.etcd.io/bbolt
+module 13eholder/vmbolt
 
 go 1.23
 

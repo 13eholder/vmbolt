@@ -1,8 +1,8 @@
 package bbolt_test
 
 import (
-	bolt "go.etcd.io/bbolt"
-	"go.etcd.io/bbolt/internal/common"
+	bolt "13eholder/vmbolt"
+	"13eholder/vmbolt/internal/common"
 )
 
 // `dumpBucket` dumps all the data, including both key/value data

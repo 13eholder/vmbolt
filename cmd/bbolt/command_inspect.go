@@ -7,7 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	bolt "go.etcd.io/bbolt"
+	bolt "13eholder/vmbolt"
 )
 
 func newInspectCommand() *cobra.Command {

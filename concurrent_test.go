@@ -20,7 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 
-	bolt "go.etcd.io/bbolt"
+	bolt "13eholder/vmbolt"
 )
 
 const (

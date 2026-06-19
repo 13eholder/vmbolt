@@ -1,6 +1,6 @@
 package bbolt
 
-import "go.etcd.io/bbolt/errors"
+import "13eholder/vmbolt/errors"
 
 // These errors can be returned when opening or calling methods on a DB.
 var (

@@ -9,8 +9,8 @@ import (
 	"bytes"
 	"fmt"
 
-	"go.etcd.io/bbolt/internal/common"
-	"go.etcd.io/bbolt/internal/guts_cli"
+	"13eholder/vmbolt/internal/common"
+	"13eholder/vmbolt/internal/guts_cli"
 )
 
 type XRay struct {

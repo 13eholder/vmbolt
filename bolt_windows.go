@@ -9,8 +9,8 @@ import (
 
 	"golang.org/x/sys/windows"
 
-	"go.etcd.io/bbolt/errors"
-	"go.etcd.io/bbolt/internal/common"
+	"13eholder/vmbolt/errors"
+	"13eholder/vmbolt/internal/common"
 )
 
 // fdatasync flushes written data to a file descriptor.

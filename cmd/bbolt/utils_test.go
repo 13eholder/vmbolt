@@ -6,8 +6,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"go.etcd.io/bbolt/internal/common"
-	"go.etcd.io/bbolt/internal/guts_cli"
+	"13eholder/vmbolt/internal/common"
+	"13eholder/vmbolt/internal/guts_cli"
 )
 
 func loadMetaPage(t *testing.T, dbPath string, pageID uint64) *common.Meta {

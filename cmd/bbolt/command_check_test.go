@@ -7,9 +7,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	main "go.etcd.io/bbolt/cmd/bbolt"
-	"go.etcd.io/bbolt/internal/btesting"
-	"go.etcd.io/bbolt/internal/guts_cli"
+	main "13eholder/vmbolt/cmd/bbolt"
+	"13eholder/vmbolt/internal/btesting"
+	"13eholder/vmbolt/internal/guts_cli"
 )
 
 func TestCheckCommand_Run(t *testing.T) {

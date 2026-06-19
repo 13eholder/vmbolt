@@ -21,10 +21,10 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	bolt "go.etcd.io/bbolt"
-	berrors "go.etcd.io/bbolt/errors"
-	"go.etcd.io/bbolt/internal/common"
-	"go.etcd.io/bbolt/internal/guts_cli"
+	bolt "13eholder/vmbolt"
+	berrors "13eholder/vmbolt/errors"
+	"13eholder/vmbolt/internal/common"
+	"13eholder/vmbolt/internal/guts_cli"
 )
 
 var (

@@ -8,10 +8,10 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	bolt "go.etcd.io/bbolt"
-	main "go.etcd.io/bbolt/cmd/bbolt"
-	"go.etcd.io/bbolt/internal/btesting"
-	"go.etcd.io/bbolt/internal/common"
+	bolt "13eholder/vmbolt"
+	main "13eholder/vmbolt/cmd/bbolt"
+	"13eholder/vmbolt/internal/btesting"
+	"13eholder/vmbolt/internal/common"
 )
 
 func TestSurgery_Meta_Validate(t *testing.T) {

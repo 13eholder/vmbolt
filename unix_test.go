@@ -8,8 +8,8 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	bolt "go.etcd.io/bbolt"
-	"go.etcd.io/bbolt/internal/btesting"
+	bolt "13eholder/vmbolt"
+	"13eholder/vmbolt/internal/btesting"
 )
 
 func TestMlock_DbOpen(t *testing.T) {

@@ -6,8 +6,8 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
-	bolt "go.etcd.io/bbolt"
-	"go.etcd.io/bbolt/internal/guts_cli"
+	bolt "13eholder/vmbolt"
+	"13eholder/vmbolt/internal/guts_cli"
 )
 
 type checkOptions struct {
