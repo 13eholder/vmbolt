@@ -1,4 +1,4 @@
-package bbolt
+package vmbolt
 
 // See https://github.com/etcd-io/raft/blob/main/logger.go
 import (

@@ -1,6 +1,6 @@
 //go:build !windows
 
-package bbolt_test
+package vmbolt_test
 
 import (
 	"fmt"

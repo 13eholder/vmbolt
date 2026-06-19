@@ -44,7 +44,7 @@ func TestFindPathsToKey_Bucket(t *testing.T) {
 			func(tx int, k int) []byte { return []byte(fmt.Sprintf("%04d", k)) },
 			func(tx int, k int) []byte { return make([]byte, 100) },
 		))
-	require.NoError(t, db.Update(func(tx *bbolt.Tx) error {
+	require.NoError(t, db.Update(func(tx *vmbolt.Tx) error {
 		sb, err := tx.Bucket(rootBucket).CreateBucket(subBucket)
 		require.NoError(t, err)
 		require.NoError(t, sb.Put([]byte("foo"), []byte("bar")))

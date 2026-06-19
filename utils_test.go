@@ -1,4 +1,4 @@
-package bbolt_test
+package vmbolt_test
 
 import (
 	bolt "13eholder/vmbolt"

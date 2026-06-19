@@ -1,6 +1,6 @@
 //go:build aix
 
-package bbolt
+package vmbolt
 
 import (
 	"fmt"

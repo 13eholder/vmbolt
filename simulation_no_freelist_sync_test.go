@@ -1,4 +1,4 @@
-package bbolt_test
+package vmbolt_test
 
 import (
 	"testing"
