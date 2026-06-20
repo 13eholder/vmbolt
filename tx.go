@@ -23,7 +23,6 @@ type Tx struct {
 	writable bool
 	managed  bool
 	db       *DB
-	id       common.Txid
 
 	// Per-bucket tx-local contexts, created lazily by Bucket/CreateBucket/etc.
 	bctx map[string]*Bucket
@@ -41,14 +40,6 @@ type Tx struct {
 
 	stats          TxStats
 	commitHandlers []func()
-}
-
-// ID returns the transaction id.
-func (tx *Tx) ID() int {
-	if tx == nil {
-		return -1
-	}
-	return int(tx.id)
 }
 
 // DB returns a reference to the database that created the transaction.
@@ -339,15 +330,14 @@ func (tx *Tx) putBctx(key string, b *Bucket) {
 // Steps 1-2 perform no publication, so a failure leaves nothing published and
 // the tx rolls back cleanly.
 func (tx *Tx) Commit() (err error) {
-	txId := tx.ID()
 	lg := tx.db.Logger()
 	if lg != discardLogger {
-		lg.Debugf("Committing transaction %d", txId)
+		lg.Debugf("Committing transaction ")
 		defer func() {
 			if err != nil {
 				lg.Errorf("Committing transaction failed: %v", err)
 			} else {
-				lg.Debugf("Committing transaction %d successfully", txId)
+				lg.Debugf("Committing transaction successfully")
 			}
 		}()
 	}

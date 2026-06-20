@@ -73,9 +73,7 @@ func newBucketForHandle(tx *Tx, name string, h *bucketHandle) *Bucket {
 	} else {
 		b.base = h.state.Load()
 	}
-	if b.base != nil {
-		b.sequence = b.base.sequence
-	}
+
 	if tx.writable {
 		b.dirty = make(map[common.Nid]*workNode)
 		b.obsolete = make(map[common.Nid]struct{})
@@ -105,11 +103,6 @@ func (b *Bucket) Root() common.Nid {
 		return b.base.root
 	}
 	return 0
-}
-
-// RootPage is preserved for vmbolt API compatibility; it returns Root().
-func (b *Bucket) RootPage() common.Nid {
-	return b.Root()
 }
 
 // Writable returns whether the bucket is writable.
@@ -192,7 +185,7 @@ func (b *Bucket) SetSequence(v uint64) error {
 	// Materialize the root node if it hasn't been already, so the bucket is
 	// saved during commit even if only the sequence changed.
 	if b.rootNode == nil {
-		_ = b.node(b.RootPage(), nil)
+		_ = b.node(b.Root(), nil)
 	}
 	b.sequence = v
 	return nil
@@ -206,7 +199,7 @@ func (b *Bucket) NextSequence() (uint64, error) {
 		return 0, errors.ErrTxNotWritable
 	}
 	if b.rootNode == nil {
-		_ = b.node(b.RootPage(), nil)
+		_ = b.node(b.Root(), nil)
 	}
 	b.sequence++
 	return b.sequence, nil
@@ -321,14 +314,14 @@ func (b *Bucket) Stats() BucketStats {
 
 // forEachNode iterates over every node in a bucket.
 func (b *Bucket) forEachNode(fn func(*node, int)) {
-	if b.rootNode != nil && b.RootPage() == 0 {
+	if b.rootNode != nil && b.Root() == 0 {
 		fn(b.rootNode.readNodeView(), 0)
 		return
 	}
 	if !b.hasCommittedRoot() {
 		return
 	}
-	b._forEachNode(b.RootPage(), 0, fn)
+	b._forEachNode(b.Root(), 0, fn)
 }
 
 func (b *Bucket) _forEachNode(nid common.Nid, depth int, fn func(*node, int)) {
@@ -510,10 +503,9 @@ func (b *Bucket) buildPublishedState() *bucketState {
 	}
 
 	return &bucketState{
-		id:       b.handle.id,
-		root:     rootNid,
-		nodes:    newNodes,
-		sequence: b.sequence,
+		id:    b.handle.id,
+		root:  rootNid,
+		nodes: newNodes,
 	}
 }
 

@@ -116,10 +116,6 @@ func Open(path string, mode os.FileMode, options *Options) (db *DB, err error) {
 		}()
 	}
 
-	if db.pageSize = options.PageSize; db.pageSize == 0 {
-		db.pageSize = common.DefaultPageSize
-	}
-
 	db.path = path
 
 	// Initialize the database.
@@ -231,7 +227,7 @@ func (db *DB) beginTx() (*Tx, error) {
 
 	// Read transactions lazily pin each touched bucket's current generation on
 	// first access (per-bucket snapshot isolation). There is no global snapshot.
-	t := &Tx{db: db, id: common.Txid(db.txid.Load())}
+	t := &Tx{db: db}
 
 	// Update the transaction stats.
 	if db.stats != nil {
@@ -262,7 +258,7 @@ func (db *DB) beginRWTx() (*Tx, error) {
 	}
 
 	// Create a transaction associated with the database.
-	t := &Tx{db: db, writable: true, id: common.Txid(db.txid.Add(1))}
+	t := &Tx{db: db, writable: true}
 	db.rwtx = t
 	return t, nil
 }

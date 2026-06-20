@@ -20,7 +20,7 @@ type Inodes []Inode
 func (in *Inode) Flags() uint32         { return in.flags }
 func (in *Inode) SetFlags(flags uint32) { in.flags = flags }
 func (in *Inode) Nid() Nid              { return in.nid }
-func (in *Inode) SetPgid(id Nid)        { in.nid = id } // historical name; sets the child Nid
+func (in *Inode) SetNid(id Nid)         { in.nid = id }
 func (in *Inode) Key() []byte           { return in.key }
 func (in *Inode) SetKey(key []byte)     { in.key = key }
 func (in *Inode) Value() []byte         { return in.value }

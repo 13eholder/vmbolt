@@ -48,7 +48,7 @@ func (c *Cursor) First() (key []byte, value []byte) {
 
 func (c *Cursor) first() (key []byte, value []byte, flags uint32) {
 	c.stack = c.stack[:0]
-	n := c.bucket.pageNode(c.bucket.RootPage())
+	n := c.bucket.pageNode(c.bucket.Root())
 	c.stack = append(c.stack, elemRef{node: n, index: 0})
 	c.goToFirstElementOnTheStack()
 
@@ -71,7 +71,7 @@ func (c *Cursor) Last() (key []byte, value []byte) {
 	}
 	common.Assert(c.bucket.tx.db != nil, "tx closed")
 	c.stack = c.stack[:0]
-	n := c.bucket.pageNode(c.bucket.RootPage())
+	n := c.bucket.pageNode(c.bucket.Root())
 	ref := elemRef{node: n}
 	ref.index = ref.count() - 1
 	c.stack = append(c.stack, ref)
@@ -159,7 +159,7 @@ func (c *Cursor) dirKeyValue() ([]byte, []byte) {
 func (c *Cursor) seek(seek []byte) (key []byte, value []byte, flags uint32) {
 	// Start from root node and traverse to correct node.
 	c.stack = c.stack[:0]
-	c.search(seek, c.bucket.RootPage())
+	c.search(seek, c.bucket.Root())
 	return c.keyValue()
 }
 
@@ -331,7 +331,7 @@ func (c *Cursor) node() *workNode {
 	common.Assert(len(c.stack) > 0, "accessing a node with a zero-length cursor stack")
 
 	// Start from root and traverse down the hierarchy.
-	n := c.bucket.node(c.bucket.RootPage(), nil)
+	n := c.bucket.node(c.bucket.Root(), nil)
 	for _, ref := range c.stack[:len(c.stack)-1] {
 		common.Assert(!n.isLeaf, "expected branch node")
 		n = n.childAt(ref.index)

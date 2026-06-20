@@ -10,10 +10,9 @@ import (
 // it via bucketHandle.state.Load(); a write transaction builds a fresh one and
 // Stores it atomically. Once published it is never mutated.
 type bucketState struct {
-	id       common.BucketId
-	root     common.Nid               // full Nid of the root node (0 while a new bucket is unfinalized)
-	nodes    map[common.Nid]*snapNode // this bucket's B+tree, keyed by full Nid
-	sequence uint64
+	id    common.BucketId
+	root  common.Nid               // full Nid of the root node (0 while a new bucket is unfinalized)
+	nodes map[common.Nid]*snapNode // this bucket's B+tree, keyed by full Nid
 }
 
 // bucketHandle is the long-lived, DB-level handle for one top-level bucket. It

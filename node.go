@@ -120,7 +120,7 @@ func (n *workNode) put(oldKey, newKey, value []byte, nId common.Nid, flags uint3
 	inode.SetFlags(flags)
 	inode.SetKey(newKey)
 	inode.SetValue(value)
-	inode.SetPgid(nId)
+	inode.SetNid(nId)
 	common.Assert(len(inode.Key()) > 0, "put: zero-length inode key")
 }
 
