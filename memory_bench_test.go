@@ -260,24 +260,6 @@ func BenchmarkSeqReadWrite_1KB(b *testing.B) {
 	benchmarkSequentialReadWrite(b, 1024)
 }
 
-// latencyRecorder collects latency samples and reports percentiles.
-type latencyRecorder struct {
-	samples []time.Duration
-}
-
-func (lr *latencyRecorder) record(d time.Duration) {
-	lr.samples = append(lr.samples, d)
-}
-
-func (lr *latencyRecorder) report(b *testing.B) {
-	if len(lr.samples) == 0 {
-		return
-	}
-	// Simple bubble sort for small samples or just use sort.Slice
-	// For benchmark reporting we can just compute approximate percentiles.
-	// Use testing.B.ReportMetric with custom metrics.
-}
-
 func BenchmarkLatency_Put_128B(b *testing.B) {
 	benchmarkLatencyPut(b, 128)
 }

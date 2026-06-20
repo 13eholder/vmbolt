@@ -423,10 +423,6 @@ func (n *node) dump() {
 }
 */
 
-func compareKeys(left, right []byte) int {
-	return bytes.Compare(left, right)
-}
-
 type workNodes []*workNode
 
 func (s workNodes) Len() int      { return len(s) }

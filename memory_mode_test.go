@@ -187,7 +187,7 @@ func TestMemoryMode_MVCCIsolation(t *testing.T) {
 	// Start a read-only transaction and keep it open.
 	readTx, err := db.Begin(false)
 	require.NoError(t, err)
-	defer readTx.Rollback()
+	defer func() { _ = readTx.Rollback() }()
 
 	// Verify initial value in read tx.
 	b := readTx.Bucket([]byte("mvcc"))
@@ -261,7 +261,7 @@ func TestMemoryMode_PageReuseIsolation(t *testing.T) {
 	// Start a read transaction.
 	readTx, err := db.Begin(false)
 	require.NoError(t, err)
-	defer readTx.Rollback()
+	defer func() { _ = readTx.Rollback() }()
 
 	// Capture a cursor snapshot in the old read tx.
 	b := readTx.Bucket([]byte("data"))
