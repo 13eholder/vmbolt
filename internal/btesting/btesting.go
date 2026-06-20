@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
 	"testing"
 	"time"
 
@@ -44,20 +43,22 @@ func MustCreateDBWithOption(t testing.TB, o *bolt.Options) *DB {
 }
 
 func MustOpenDBWithOption(t testing.TB, f string, o *bolt.Options) *DB {
-	t.Logf("Opening bbolt DB at: %s", f)
+	db, err := OpenDBWithOption(t, f, o)
+	require.NoError(t, err)
+	require.NotNil(t, db)
+	return db
+}
+
+func OpenDBWithOption(t testing.TB, f string, o *bolt.Options) (*DB, error) {
+	t.Logf("Opening vmbolt DB at: %s", f)
 	if o == nil {
 		o = bolt.DefaultOptions
 	}
 
-	freelistType := bolt.FreelistArrayType
-	if env := os.Getenv(TestFreelistType); env == string(bolt.FreelistMapType) {
-		freelistType = bolt.FreelistMapType
-	}
-
-	o.FreelistType = freelistType
-
 	db, err := bolt.Open(f, 0600, o)
-	require.NoError(t, err)
+	if err != nil {
+		return nil, err
+	}
 	resDB := &DB{
 		DB: db,
 		f:  f,
@@ -66,7 +67,7 @@ func MustOpenDBWithOption(t testing.TB, f string, o *bolt.Options) *DB {
 	}
 	resDB.strictModeEnabledDefault()
 	t.Cleanup(resDB.PostTestCleanup)
-	return resDB
+	return resDB, nil
 }
 
 func (db *DB) PostTestCleanup() {
@@ -84,7 +85,7 @@ func (db *DB) Close() error {
 		if *statsFlag {
 			db.PrintStats()
 		}
-		db.t.Logf("Closing bbolt DB at: %s", db.f)
+		db.t.Logf("Closing vmbolt DB at: %s", db.f)
 		err := db.DB.Close()
 		if err != nil {
 			return err
@@ -114,7 +115,7 @@ func (db *DB) MustReopen() {
 	if db.DB != nil {
 		panic("Please call Close() before MustReopen()")
 	}
-	db.t.Logf("Reopening bbolt DB at: %s", db.f)
+	db.t.Logf("Reopening vmbolt DB at: %s", db.f)
 	indb, err := bolt.Open(db.Path(), 0600, db.o)
 	require.NoError(db.t, err)
 	db.DB = indb
@@ -133,21 +134,14 @@ func (db *DB) MustCheck() {
 			}
 		}
 
-		// If errors occurred, copy the DB and print the errors.
+		// If errors occurred, print the errors.
 		if len(errors) > 0 {
-			var path = filepath.Join(db.t.TempDir(), "db.backup")
-			err := tx.CopyFile(path, 0600)
-			require.NoError(db.t, err)
-
 			// Print errors.
 			fmt.Print("\n\n")
 			fmt.Printf("consistency check failed (%d errors)\n", len(errors))
 			for _, err := range errors {
 				fmt.Println(err)
 			}
-			fmt.Println("")
-			fmt.Println("db saved to:")
-			fmt.Println(path)
 			fmt.Print("\n\n")
 			os.Exit(-1)
 		}
@@ -211,11 +205,9 @@ func truncDuration(d time.Duration) string {
 	return regexp.MustCompile(`^(\d+)(\.\d+)`).ReplaceAllString(d.String(), "$1")
 }
 
-func (db *DB) strictModeEnabledDefault() {
-	strictModeEnabled := strings.ToLower(os.Getenv(TestEnableStrictMode))
-	db.StrictMode = strictModeEnabled == "true"
-}
+// strictModeEnabledDefault is retained as a no-op: strict mode (post-commit
+// Check) is not applicable to the pure-memory engine, where Tx.Check is a stub.
+func (db *DB) strictModeEnabledDefault() {}
 
-func (db *DB) ForceDisableStrictMode() {
-	db.StrictMode = false
-}
+// ForceDisableStrictMode is retained as a no-op for API compatibility.
+func (db *DB) ForceDisableStrictMode() {}

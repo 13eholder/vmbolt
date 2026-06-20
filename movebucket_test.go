@@ -7,14 +7,15 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"13eholder/vmbolt"
 	"13eholder/vmbolt/errors"
 	"13eholder/vmbolt/internal/btesting"
-
-	"github.com/stretchr/testify/require"
 )
 
 func TestTx_MoveBucket(t *testing.T) {
+	t.Skip("not applicable to pure memory mode")
 	testCases := []struct {
 		name                    string
 		srcBucketPath           []string
@@ -217,6 +218,7 @@ func TestTx_MoveBucket(t *testing.T) {
 }
 
 func TestBucket_MoveBucket_DiffDB(t *testing.T) {
+	t.Skip("not applicable to pure memory mode")
 	srcBucketPath := []string{"sb1", "sb2"}
 	dstBucketPath := []string{"db1", "db2"}
 	bucketToMove := "bucketToMove"
@@ -265,6 +267,7 @@ func TestBucket_MoveBucket_DiffDB(t *testing.T) {
 }
 
 func TestBucket_MoveBucket_DiffTx(t *testing.T) {
+	t.Skip("bucket move is not applicable to pure memory top-level bucket model")
 	testCases := []struct {
 		name            string
 		srcBucketPath   []string

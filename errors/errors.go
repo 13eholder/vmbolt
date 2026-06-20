@@ -1,5 +1,5 @@
 // Package errors defines the error variables that may be returned
-// during bbolt operations.
+// during vmbolt operations.
 package errors
 
 import "errors"
@@ -69,6 +69,9 @@ var (
 	// ErrValueTooLarge is returned when inserting a value that is larger than MaxValueSize.
 	ErrValueTooLarge = errors.New("value too large")
 
+	// ErrMaxSizeReached is returned when the configured maximum size of the data file is reached.
+	ErrMaxSizeReached = errors.New("database reached maximum size")
+
 	// ErrIncompatibleValue is returned when trying to create or delete a bucket
 	// on an existing non-bucket key or when trying to create or delete a
 	// non-bucket key on an existing bucket key.
@@ -81,4 +84,9 @@ var (
 	// ErrDifferentDB is returned when trying to move a sub-bucket between
 	// source and target buckets, while source and target buckets are in different database files.
 	ErrDifferentDB = errors.New("the source and target buckets are in different database files")
+
+	// ErrNestedBucketsUnsupported is returned when the pure memory engine is
+	// asked to create, delete, or move nested buckets. The node-centric memory
+	// design only supports independent top-level buckets.
+	ErrNestedBucketsUnsupported = errors.New("nested buckets are not supported in pure memory mode")
 )

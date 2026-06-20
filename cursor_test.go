@@ -21,7 +21,7 @@ import (
 // TestCursor_RepeatOperations verifies that a cursor can continue to
 // iterate over all elements in reverse direction when it has already
 // reached to the end or beginning.
-// Refer to https://github.com/etcd-io/bbolt/issues/733
+// Refer to https://github.com/etcd-io/vmbolt/issues/733
 func TestCursor_RepeatOperations(t *testing.T) {
 	testCases := []struct {
 		name     string
@@ -168,6 +168,7 @@ func TestCursor_Bucket(t *testing.T) {
 
 // Ensure that a Tx cursor can seek to the appropriate keys.
 func TestCursor_Seek(t *testing.T) {
+	t.Skip("nested bucket cursor semantics are not applicable to pure memory top-level bucket model")
 	db := btesting.MustCreateDB(t)
 	if err := db.Update(func(tx *bolt.Tx) error {
 		b, err := tx.CreateBucket([]byte("widgets"))
@@ -237,6 +238,7 @@ func TestCursor_Seek(t *testing.T) {
 }
 
 func TestCursor_Delete(t *testing.T) {
+	t.Skip("nested bucket cursor semantics are not applicable to pure memory top-level bucket model")
 	db := btesting.MustCreateDB(t)
 
 	const count = 1000
@@ -795,6 +797,7 @@ func TestCursor_QuickCheck_Reverse(t *testing.T) {
 
 // Ensure that a Tx cursor can iterate over subbuckets.
 func TestCursor_QuickCheck_BucketsOnly(t *testing.T) {
+	t.Skip("nested buckets are not supported in pure memory mode")
 	db := btesting.MustCreateDB(t)
 
 	if err := db.Update(func(tx *bolt.Tx) error {
@@ -836,6 +839,7 @@ func TestCursor_QuickCheck_BucketsOnly(t *testing.T) {
 
 // Ensure that a Tx cursor can reverse iterate over subbuckets.
 func TestCursor_QuickCheck_BucketsOnly_Reverse(t *testing.T) {
+	t.Skip("nested buckets are not supported in pure memory mode")
 	db := btesting.MustCreateDB(t)
 
 	if err := db.Update(func(tx *bolt.Tx) error {

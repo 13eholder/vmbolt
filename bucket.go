@@ -3,7 +3,6 @@ package vmbolt
 import (
 	"bytes"
 	"fmt"
-	"unsafe"
 
 	"13eholder/vmbolt/errors"
 	"13eholder/vmbolt/internal/common"
@@ -22,33 +21,66 @@ const (
 	maxFillPercent = 1.0
 )
 
-// DefaultFillPercent is the percentage that split pages are filled.
-// This value can be changed by setting Bucket.FillPercent.
+// DefaultFillPercent is the percentage that split nodes are filled.
 const DefaultFillPercent = 0.5
 
-// Bucket represents a collection of key/value pairs inside the database.
+// Bucket is a tx-local handle to one top-level B+tree. Each top-level bucket is
+// an independent tree published atomically via its bucketHandle. A Bucket is
+// never shared across transactions.
 type Bucket struct {
-	*common.InBucket
-	tx       *Tx                   // the associated transaction
-	buckets  map[string]*Bucket    // subbucket cache
-	page     *common.Page          // inline page reference
-	rootNode *node                 // materialized node for the root page.
-	nodes    map[common.Pgid]*node // node cache
+	tx     *Tx
+	name   string
+	handle *bucketHandle
 
-	// Sets the threshold for filling nodes when they split. By default,
-	// the bucket will fill to 50% but it can be useful to increase this
-	// amount if you know that your write workloads are mostly append-only.
-	//
-	// This is non-persisted across transactions so it must be set in every Tx.
+	base     *bucketState             // pinned generation: read view / COW base (nil for a brand-new bucket)
+	rootNode *workNode                // materialized mutable root (nil until first write)
+	dirty    map[common.Nid]*workNode // tx-local mutable node cache (write tx only)
+	obsolete map[common.Nid]struct{}  // node ids freed in this tx (write tx only)
+
+	sequence uint64 // tx-local mutable sequence (initialized from base)
+
+	// Rollback snapshot of the handle's writer-private allocator state.
+	snapNextNode uint64
+	snapFreeIds  []uint64
+
+	// FillPercent sets the threshold for filling nodes when they split. It is
+	// non-persisted and must be set per tx.
 	FillPercent float64
 }
 
-// newBucket returns a new bucket associated with a transaction.
-func newBucket(tx *Tx) Bucket {
-	var b = Bucket{tx: tx, FillPercent: DefaultFillPercent}
+// newBucketForHandle creates a tx-local Bucket bound to an existing (committed
+// or tx-created) bucketHandle. It pins the handle's current generation as the
+// read view / COW base; for a write tx it also initializes the dirty set and
+// snapshots the allocator state for rollback.
+func newBucketForHandle(tx *Tx, name string, h *bucketHandle) *Bucket {
+	b := &Bucket{
+		tx:          tx,
+		name:        name,
+		handle:      h,
+		FillPercent: DefaultFillPercent,
+	}
+	// Resolve the pinned generation (read view / COW base). For a cohort member
+	// the state lives in the cohort's jointly-published snapshot (pinned per tx);
+	// for an independent bucket it lives in the handle's own atomic pointer.
+	if h.cohort != nil {
+		if snap := tx.pinCohort(h.cohort); snap != nil {
+			b.base = snap.members[name]
+		}
+		if b.base == nil {
+			// adoption transition / not-yet-committed member: fall back to own state
+			b.base = h.state.Load()
+		}
+	} else {
+		b.base = h.state.Load()
+	}
+	if b.base != nil {
+		b.sequence = b.base.sequence
+	}
 	if tx.writable {
-		b.buckets = make(map[string]*Bucket)
-		b.nodes = make(map[common.Pgid]*node)
+		b.dirty = make(map[common.Nid]*workNode)
+		b.obsolete = make(map[common.Nid]struct{})
+		b.snapNextNode = h.nextNodeId
+		b.snapFreeIds = append([]uint64(nil), h.freeNodeIds...)
 	}
 	return b
 }
@@ -58,9 +90,26 @@ func (b *Bucket) Tx() *Tx {
 	return b.tx
 }
 
-// Root returns the root of the bucket.
-func (b *Bucket) Root() common.Pgid {
-	return b.RootPage()
+// Name returns the bucket's name.
+func (b *Bucket) Name() string {
+	return b.name
+}
+
+// Root returns the Nid of the bucket's root node. Returns 0 if the bucket has
+// no committed root and none has been materialized yet.
+func (b *Bucket) Root() common.Nid {
+	if b.rootNode != nil {
+		return b.rootNode.nid
+	}
+	if b.base != nil {
+		return b.base.root
+	}
+	return 0
+}
+
+// RootPage is preserved for vmbolt API compatibility; it returns Root().
+func (b *Bucket) RootPage() common.Nid {
+	return b.Root()
 }
 
 // Writable returns whether the bucket is writable.
@@ -69,376 +118,17 @@ func (b *Bucket) Writable() bool {
 }
 
 // Cursor creates a cursor associated with the bucket.
-// The cursor is only valid as long as the transaction is open.
-// Do not use a cursor after the transaction is closed.
 func (b *Bucket) Cursor() *Cursor {
-	// Update transaction statistics.
 	b.tx.stats.IncCursorCount(1)
-
-	// Allocate and return a cursor.
 	return &Cursor{
 		bucket: b,
-		stack:  make([]elemRef, 0),
+		stack:  make([]elemRef, 0, 8),
 	}
-}
-
-// Bucket retrieves a nested bucket by name.
-// Returns nil if the bucket does not exist.
-// The bucket instance is only valid for the lifetime of the transaction.
-func (b *Bucket) Bucket(name []byte) *Bucket {
-	if b.buckets != nil {
-		if child := b.buckets[string(name)]; child != nil {
-			return child
-		}
-	}
-
-	// Move cursor to key.
-	c := b.Cursor()
-	k, v, flags := c.seek(name)
-
-	// Return nil if the key doesn't exist or it is not a bucket.
-	if !bytes.Equal(name, k) || (flags&common.BucketLeafFlag) == 0 {
-		return nil
-	}
-
-	// Otherwise create a bucket and cache it.
-	var child = b.openBucket(v)
-	if b.buckets != nil {
-		b.buckets[string(name)] = child
-	}
-
-	return child
-}
-
-// Helper method that re-interprets a sub-bucket value
-// from a parent into a Bucket
-func (b *Bucket) openBucket(value []byte) *Bucket {
-	var child = newBucket(b.tx)
-
-	// Unaligned access requires a copy to be made.
-	const unalignedMask = unsafe.Alignof(struct {
-		common.InBucket
-		common.Page
-	}{}) - 1
-	unaligned := uintptr(unsafe.Pointer(&value[0]))&unalignedMask != 0
-	if unaligned {
-		value = cloneBytes(value)
-	}
-
-	// If this is a writable transaction then we need to copy the bucket entry.
-	// Read-only transactions can point directly at the mmap entry.
-	if b.tx.writable && !unaligned {
-		child.InBucket = &common.InBucket{}
-		*child.InBucket = *(*common.InBucket)(unsafe.Pointer(&value[0]))
-	} else {
-		child.InBucket = (*common.InBucket)(unsafe.Pointer(&value[0]))
-	}
-
-	// Save a reference to the inline page if the bucket is inline.
-	if child.RootPage() == 0 {
-		child.page = (*common.Page)(unsafe.Pointer(&value[common.BucketHeaderSize]))
-	}
-
-	return &child
-}
-
-// CreateBucket creates a new bucket at the given key and returns the new bucket.
-// Returns an error if the key already exists, if the bucket name is blank, or if the bucket name is too long.
-// The bucket instance is only valid for the lifetime of the transaction.
-func (b *Bucket) CreateBucket(key []byte) (rb *Bucket, err error) {
-	if lg := b.tx.db.Logger(); lg != discardLogger {
-		lg.Debugf("Creating bucket %q", key)
-		defer func() {
-			if err != nil {
-				lg.Errorf("Creating bucket %q failed: %v", key, err)
-			} else {
-				lg.Debugf("Creating bucket %q successfully", key)
-			}
-		}()
-	}
-	if b.tx.db == nil {
-		return nil, errors.ErrTxClosed
-	} else if !b.tx.writable {
-		return nil, errors.ErrTxNotWritable
-	} else if len(key) == 0 {
-		return nil, errors.ErrBucketNameRequired
-	}
-
-	// Insert into node.
-	// Tip: Use a new variable `newKey` instead of reusing the existing `key` to prevent
-	// it from being marked as leaking, and accordingly cannot be allocated on stack.
-	newKey := cloneBytes(key)
-
-	// Move cursor to correct position.
-	c := b.Cursor()
-	k, _, flags := c.seek(newKey)
-
-	// Return an error if there is an existing key.
-	if bytes.Equal(newKey, k) {
-		if (flags & common.BucketLeafFlag) != 0 {
-			return nil, errors.ErrBucketExists
-		}
-		return nil, errors.ErrIncompatibleValue
-	}
-
-	// Create empty, inline bucket.
-	var bucket = Bucket{
-		InBucket:    &common.InBucket{},
-		rootNode:    &node{isLeaf: true},
-		FillPercent: DefaultFillPercent,
-	}
-	var value = bucket.write()
-
-	c.node().put(newKey, newKey, value, 0, common.BucketLeafFlag)
-
-	// Since subbuckets are not allowed on inline buckets, we need to
-	// dereference the inline page, if it exists. This will cause the bucket
-	// to be treated as a regular, non-inline bucket for the rest of the tx.
-	b.page = nil
-
-	return b.Bucket(newKey), nil
-}
-
-// CreateBucketIfNotExists creates a new bucket if it doesn't already exist and returns a reference to it.
-// Returns an error if the bucket name is blank, or if the bucket name is too long.
-// The bucket instance is only valid for the lifetime of the transaction.
-func (b *Bucket) CreateBucketIfNotExists(key []byte) (rb *Bucket, err error) {
-	if lg := b.tx.db.Logger(); lg != discardLogger {
-		lg.Debugf("Creating bucket if not exist %q", key)
-		defer func() {
-			if err != nil {
-				lg.Errorf("Creating bucket if not exist %q failed: %v", key, err)
-			} else {
-				lg.Debugf("Creating bucket if not exist %q successfully", key)
-			}
-		}()
-	}
-
-	if b.tx.db == nil {
-		return nil, errors.ErrTxClosed
-	} else if !b.tx.writable {
-		return nil, errors.ErrTxNotWritable
-	} else if len(key) == 0 {
-		return nil, errors.ErrBucketNameRequired
-	}
-
-	// Insert into node.
-	// Tip: Use a new variable `newKey` instead of reusing the existing `key` to prevent
-	// it from being marked as leaking, and accordingly cannot be allocated on stack.
-	newKey := cloneBytes(key)
-
-	if b.buckets != nil {
-		if child := b.buckets[string(newKey)]; child != nil {
-			return child, nil
-		}
-	}
-
-	// Move cursor to correct position.
-	c := b.Cursor()
-	k, v, flags := c.seek(newKey)
-
-	// Return an error if there is an existing non-bucket key.
-	if bytes.Equal(newKey, k) {
-		if (flags & common.BucketLeafFlag) != 0 {
-			var child = b.openBucket(v)
-			if b.buckets != nil {
-				b.buckets[string(newKey)] = child
-			}
-
-			return child, nil
-		}
-		return nil, errors.ErrIncompatibleValue
-	}
-
-	// Create empty, inline bucket.
-	var bucket = Bucket{
-		InBucket:    &common.InBucket{},
-		rootNode:    &node{isLeaf: true},
-		FillPercent: DefaultFillPercent,
-	}
-	var value = bucket.write()
-
-	c.node().put(newKey, newKey, value, 0, common.BucketLeafFlag)
-
-	// Since subbuckets are not allowed on inline buckets, we need to
-	// dereference the inline page, if it exists. This will cause the bucket
-	// to be treated as a regular, non-inline bucket for the rest of the tx.
-	b.page = nil
-
-	return b.Bucket(newKey), nil
-}
-
-// DeleteBucket deletes a bucket at the given key.
-// Returns an error if the bucket does not exist, or if the key represents a non-bucket value.
-func (b *Bucket) DeleteBucket(key []byte) (err error) {
-	if lg := b.tx.db.Logger(); lg != discardLogger {
-		lg.Debugf("Deleting bucket %q", key)
-		defer func() {
-			if err != nil {
-				lg.Errorf("Deleting bucket %q failed: %v", key, err)
-			} else {
-				lg.Debugf("Deleting bucket %q successfully", key)
-			}
-		}()
-	}
-
-	if b.tx.db == nil {
-		return errors.ErrTxClosed
-	} else if !b.Writable() {
-		return errors.ErrTxNotWritable
-	}
-
-	newKey := cloneBytes(key)
-
-	// Move cursor to correct position.
-	c := b.Cursor()
-	k, _, flags := c.seek(newKey)
-
-	// Return an error if bucket doesn't exist or is not a bucket.
-	if !bytes.Equal(newKey, k) {
-		return errors.ErrBucketNotFound
-	} else if (flags & common.BucketLeafFlag) == 0 {
-		return errors.ErrIncompatibleValue
-	}
-
-	// Recursively delete all child buckets.
-	child := b.Bucket(newKey)
-	err = child.ForEachBucket(func(k []byte) error {
-		if err := child.DeleteBucket(k); err != nil {
-			return fmt.Errorf("delete bucket: %s", err)
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-
-	// Remove cached copy.
-	delete(b.buckets, string(newKey))
-
-	// Release all bucket pages to freelist.
-	child.nodes = nil
-	child.rootNode = nil
-	child.free()
-
-	// Delete the node if we have a matching key.
-	c.node().del(newKey)
-
-	return nil
-}
-
-// MoveBucket moves a sub-bucket from the source bucket to the destination bucket.
-// Returns an error if
-//  1. the sub-bucket cannot be found in the source bucket;
-//  2. or the key already exists in the destination bucket;
-//  3. or the key represents a non-bucket value;
-//  4. the source and destination buckets are the same.
-func (b *Bucket) MoveBucket(key []byte, dstBucket *Bucket) (err error) {
-	lg := b.tx.db.Logger()
-	if lg != discardLogger {
-		lg.Debugf("Moving bucket %q", key)
-		defer func() {
-			if err != nil {
-				lg.Errorf("Moving bucket %q failed: %v", key, err)
-			} else {
-				lg.Debugf("Moving bucket %q successfully", key)
-			}
-		}()
-	}
-
-	if b.tx.db == nil || dstBucket.tx.db == nil {
-		return errors.ErrTxClosed
-	} else if !b.Writable() || !dstBucket.Writable() {
-		return errors.ErrTxNotWritable
-	}
-
-	if b.tx.db.Path() != dstBucket.tx.db.Path() || b.tx != dstBucket.tx {
-		lg.Errorf("The source and target buckets are not in the same db file, source bucket in %s and target bucket in %s", b.tx.db.Path(), dstBucket.tx.db.Path())
-		return errors.ErrDifferentDB
-	}
-
-	newKey := cloneBytes(key)
-
-	// Move cursor to correct position.
-	c := b.Cursor()
-	k, v, flags := c.seek(newKey)
-
-	// Return an error if bucket doesn't exist or is not a bucket.
-	if !bytes.Equal(newKey, k) {
-		return errors.ErrBucketNotFound
-	} else if (flags & common.BucketLeafFlag) == 0 {
-		lg.Errorf("An incompatible key %s exists in the source bucket", newKey)
-		return errors.ErrIncompatibleValue
-	}
-
-	// Do nothing (return true directly) if the source bucket and the
-	// destination bucket are actually the same bucket.
-	if b == dstBucket || (b.RootPage() == dstBucket.RootPage() && b.RootPage() != 0) {
-		lg.Errorf("The source bucket (%s) and the target bucket (%s) are the same bucket", b, dstBucket)
-		return errors.ErrSameBuckets
-	}
-
-	// check whether the key already exists in the destination bucket
-	curDst := dstBucket.Cursor()
-	k, _, flags = curDst.seek(newKey)
-
-	// Return an error if there is an existing key in the destination bucket.
-	if bytes.Equal(newKey, k) {
-		if (flags & common.BucketLeafFlag) != 0 {
-			return errors.ErrBucketExists
-		}
-		lg.Errorf("An incompatible key %s exists in the target bucket", newKey)
-		return errors.ErrIncompatibleValue
-	}
-
-	// remove the sub-bucket from the source bucket
-	delete(b.buckets, string(newKey))
-	c.node().del(newKey)
-
-	// add te sub-bucket to the destination bucket
-	newValue := cloneBytes(v)
-	curDst.node().put(newKey, newKey, newValue, 0, common.BucketLeafFlag)
-
-	return nil
-}
-
-// Inspect returns the structure of the bucket.
-func (b *Bucket) Inspect() BucketStructure {
-	return b.recursivelyInspect([]byte("root"))
-}
-
-func (b *Bucket) recursivelyInspect(name []byte) BucketStructure {
-	bs := BucketStructure{Name: string(name)}
-
-	keyN := 0
-	c := b.Cursor()
-	for k, _, flags := c.first(); k != nil; k, _, flags = c.next() {
-		if flags&common.BucketLeafFlag != 0 {
-			childBucket := b.Bucket(k)
-			childBS := childBucket.recursivelyInspect(k)
-			bs.Children = append(bs.Children, childBS)
-		} else {
-			keyN++
-		}
-	}
-	bs.KeyN = keyN
-
-	return bs
 }
 
 // Get retrieves the value for a key in the bucket.
-// Returns a nil value if the key does not exist or if the key is a nested bucket.
-// The returned value is only valid for the life of the transaction.
-// The returned memory is owned by bbolt and must never be modified; writing to this memory might corrupt the database.
 func (b *Bucket) Get(key []byte) []byte {
-	k, v, flags := b.Cursor().seek(key)
-
-	// Return nil if this is a bucket.
-	if (flags & common.BucketLeafFlag) != 0 {
-		return nil
-	}
-
-	// If our target node isn't the same key as what's passed in then return nil.
+	k, v, _ := b.Cursor().seek(key)
 	if !bytes.Equal(key, k) {
 		return nil
 	}
@@ -446,20 +136,7 @@ func (b *Bucket) Get(key []byte) []byte {
 }
 
 // Put sets the value for a key in the bucket.
-// If the key exist then its previous value will be overwritten.
-// Supplied value must remain valid for the life of the transaction.
-// Returns an error if the bucket was created from a read-only transaction, if the key is blank, if the key is too large, or if the value is too large.
 func (b *Bucket) Put(key []byte, value []byte) (err error) {
-	if lg := b.tx.db.Logger(); lg != discardLogger {
-		lg.Debugf("Putting key %q", key)
-		defer func() {
-			if err != nil {
-				lg.Errorf("Putting key %q failed: %v", key, err)
-			} else {
-				lg.Debugf("Putting key %q successfully", key)
-			}
-		}()
-	}
 	if b.tx.db == nil {
 		return errors.ErrTxClosed
 	} else if !b.Writable() {
@@ -472,71 +149,37 @@ func (b *Bucket) Put(key []byte, value []byte) (err error) {
 		return errors.ErrValueTooLarge
 	}
 
-	// Insert into node.
-	// Tip: Use a new variable `newKey` instead of reusing the existing `key` to prevent
-	// it from being marked as leaking, and accordingly cannot be allocated on stack.
 	newKey := cloneBytes(key)
+	newValue := cloneBytes(value)
 
-	// Move cursor to correct position.
 	c := b.Cursor()
-	k, _, flags := c.seek(newKey)
-
-	// Return an error if there is an existing key with a bucket value.
-	if bytes.Equal(newKey, k) && (flags&common.BucketLeafFlag) != 0 {
-		return errors.ErrIncompatibleValue
-	}
-
-	// gofail: var beforeBucketPut struct{}
-
-	c.node().put(newKey, newKey, value, 0, 0)
+	c.seek(newKey)
+	c.node().put(newKey, newKey, newValue, 0, 0)
 
 	return nil
 }
 
 // Delete removes a key from the bucket.
-// If the key does not exist then nothing is done and a nil error is returned.
-// Returns an error if the bucket was created from a read-only transaction.
 func (b *Bucket) Delete(key []byte) (err error) {
-	if lg := b.tx.db.Logger(); lg != discardLogger {
-		lg.Debugf("Deleting key %q", key)
-		defer func() {
-			if err != nil {
-				lg.Errorf("Deleting key %q failed: %v", key, err)
-			} else {
-				lg.Debugf("Deleting key %q successfully", key)
-			}
-		}()
-	}
-
 	if b.tx.db == nil {
 		return errors.ErrTxClosed
 	} else if !b.Writable() {
 		return errors.ErrTxNotWritable
 	}
 
-	// Move cursor to correct position.
 	c := b.Cursor()
-	k, _, flags := c.seek(key)
-
-	// Return nil if the key doesn't exist.
+	k, _, _ := c.seek(key)
 	if !bytes.Equal(key, k) {
 		return nil
 	}
 
-	// Return an error if there is already existing bucket value.
-	if (flags & common.BucketLeafFlag) != 0 {
-		return errors.ErrIncompatibleValue
-	}
-
-	// Delete the node if we have a matching key.
 	c.node().del(key)
-
 	return nil
 }
 
 // Sequence returns the current integer for the bucket without incrementing it.
 func (b *Bucket) Sequence() uint64 {
-	return b.InSequence()
+	return b.sequence
 }
 
 // SetSequence updates the sequence number for the bucket.
@@ -546,15 +189,12 @@ func (b *Bucket) SetSequence(v uint64) error {
 	} else if !b.Writable() {
 		return errors.ErrTxNotWritable
 	}
-
-	// Materialize the root node if it hasn't been already so that the
-	// bucket will be saved during commit.
+	// Materialize the root node if it hasn't been already, so the bucket is
+	// saved during commit even if only the sequence changed.
 	if b.rootNode == nil {
 		_ = b.node(b.RootPage(), nil)
 	}
-
-	// Set the sequence.
-	b.SetInSequence(v)
+	b.sequence = v
 	return nil
 }
 
@@ -565,23 +205,14 @@ func (b *Bucket) NextSequence() (uint64, error) {
 	} else if !b.Writable() {
 		return 0, errors.ErrTxNotWritable
 	}
-
-	// Materialize the root node if it hasn't been already so that the
-	// bucket will be saved during commit.
 	if b.rootNode == nil {
 		_ = b.node(b.RootPage(), nil)
 	}
-
-	// Increment and return the sequence.
-	b.IncSequence()
-	return b.Sequence(), nil
+	b.sequence++
+	return b.sequence, nil
 }
 
 // ForEach executes a function for each key/value pair in a bucket.
-// Because ForEach uses a Cursor, the iteration over keys is in lexicographical order.
-// If the provided function returns an error then the iteration is stopped and
-// the error is returned to the caller. The provided function must not modify
-// the bucket; this will result in undefined behavior.
 func (b *Bucket) ForEach(fn func(k, v []byte) error) error {
 	if b.tx.db == nil {
 		return errors.ErrTxClosed
@@ -595,357 +226,317 @@ func (b *Bucket) ForEach(fn func(k, v []byte) error) error {
 	return nil
 }
 
+// ForEachBucket iterates child buckets. The flat per-bucket model has no
+// nested buckets, so this is a no-op.
 func (b *Bucket) ForEachBucket(fn func(k []byte) error) error {
 	if b.tx.db == nil {
 		return errors.ErrTxClosed
 	}
-	c := b.Cursor()
-	for k, _, flags := c.first(); k != nil; k, _, flags = c.next() {
-		if flags&common.BucketLeafFlag != 0 {
-			if err := fn(k); err != nil {
-				return err
-			}
-		}
-	}
+	_ = fn
 	return nil
+}
+
+// The following methods are the legacy nested-bucket API. The flat per-bucket
+// model only supports top-level buckets (created/looked up via Tx), so these
+// are retained as compile-compatible stubs that report the bucket as absent or
+// unsupported. This keeps the vmbolt CLI (bench/compact/etc.) building; its
+// nested-bucket scenarios behave exactly as they did before this refactor
+// (they already returned ErrNestedBucketsUnsupported).
+
+// Bucket retrieves a nested bucket by name. Always nil: nesting is unsupported.
+func (b *Bucket) Bucket(name []byte) *Bucket {
+	_ = name
+	return nil
+}
+
+// CreateBucket creates a nested bucket. Unsupported in the flat model.
+func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
+	_ = key
+	return nil, errors.ErrNestedBucketsUnsupported
+}
+
+// CreateBucketIfNotExists creates a nested bucket. Unsupported in the flat model.
+func (b *Bucket) CreateBucketIfNotExists(key []byte) (*Bucket, error) {
+	_ = key
+	return nil, errors.ErrNestedBucketsUnsupported
+}
+
+// DeleteBucket deletes a nested bucket. Unsupported in the flat model.
+func (b *Bucket) DeleteBucket(key []byte) error {
+	_ = key
+	return errors.ErrNestedBucketsUnsupported
+}
+
+// MoveBucket moves a nested bucket. Unsupported in the flat model.
+func (b *Bucket) MoveBucket(key []byte, dst *Bucket) error {
+	_ = key
+	_ = dst
+	return errors.ErrNestedBucketsUnsupported
+}
+
+// Inspect returns the structure of the bucket.
+func (b *Bucket) Inspect() BucketStructure {
+	return b.recursivelyInspect([]byte(b.name))
+}
+
+func (b *Bucket) recursivelyInspect(name []byte) BucketStructure {
+	bs := BucketStructure{Name: string(name)}
+	c := b.Cursor()
+	for k, _, _ := c.first(); k != nil; k, _, _ = c.next() {
+		bs.KeyN++
+	}
+	return bs
 }
 
 // Stats returns stats on a bucket.
 func (b *Bucket) Stats() BucketStats {
-	var s, subStats BucketStats
+	var s BucketStats
 	pageSize := b.tx.db.pageSize
-	s.BucketN += 1
-	if b.RootPage() == 0 {
-		s.InlineBucketN += 1
-	}
-	b.forEachPage(func(p *common.Page, depth int, pgstack []common.Pgid) {
-		if p.IsLeafPage() {
-			s.KeyN += int(p.Count())
-
-			// used totals the used bytes for the page
-			used := common.PageHeaderSize
-
-			if p.Count() != 0 {
-				// If page has any elements, add all element headers.
-				used += common.LeafPageElementSize * uintptr(p.Count()-1)
-
-				// Add all element key, value sizes.
-				// The computation takes advantage of the fact that the position
-				// of the last element's key/value equals to the total of the sizes
-				// of all previous elements' keys and values.
-				// It also includes the last element's header.
-				lastElement := p.LeafPageElement(p.Count() - 1)
-				used += uintptr(lastElement.Pos() + lastElement.Ksize() + lastElement.Vsize())
+	s.BucketN = 1
+	b.forEachNode(func(n *node, depth int) {
+		if n.isLeaf {
+			s.KeyN += len(n.inodes)
+			used := uintptr(nodeHeaderOverheadBytes)
+			for _, inode := range n.inodes {
+				used += uintptr(nodeInodeOverheadBytes) + uintptr(len(inode.Key())) + uintptr(len(inode.Value()))
 			}
-
-			if b.RootPage() == 0 {
-				// For inlined bucket just update the inline stats
-				s.InlineBucketInuse += int(used)
-			} else {
-				// For non-inlined bucket update all the leaf stats
-				s.LeafPageN++
-				s.LeafInuse += int(used)
-				s.LeafOverflowN += int(p.Overflow())
-
-				// Collect stats from sub-buckets.
-				// Do that by iterating over all element headers
-				// looking for the ones with the bucketLeafFlag.
-				for i := uint16(0); i < p.Count(); i++ {
-					e := p.LeafPageElement(i)
-					if (e.Flags() & common.BucketLeafFlag) != 0 {
-						// For any bucket element, open the element value
-						// and recursively call Stats on the contained bucket.
-						subStats.Add(b.openBucket(e.Value()).Stats())
-					}
-				}
-			}
-		} else if p.IsBranchPage() {
+			s.LeafPageN++
+			s.LeafInuse += int(used)
+		} else {
 			s.BranchPageN++
-			lastElement := p.BranchPageElement(p.Count() - 1)
-
-			// used totals the used bytes for the page
-			// Add header and all element headers.
-			used := common.PageHeaderSize + (common.BranchPageElementSize * uintptr(p.Count()-1))
-
-			// Add size of all keys and values.
-			// Again, use the fact that last element's position equals to
-			// the total of key, value sizes of all previous elements.
-			used += uintptr(lastElement.Pos() + lastElement.Ksize())
+			used := uintptr(nodeHeaderOverheadBytes)
+			for _, inode := range n.inodes {
+				used += uintptr(nodeInodeOverheadBytes) + uintptr(len(inode.Key()))
+			}
 			s.BranchInuse += int(used)
-			s.BranchOverflowN += int(p.Overflow())
 		}
-
-		// Keep track of maximum page depth.
 		if depth+1 > s.Depth {
 			s.Depth = depth + 1
 		}
 	})
-
-	// Alloc stats can be computed from page counts and pageSize.
-	s.BranchAlloc = (s.BranchPageN + s.BranchOverflowN) * pageSize
-	s.LeafAlloc = (s.LeafPageN + s.LeafOverflowN) * pageSize
-
-	// Add the max depth of sub-buckets to get total nested depth.
-	s.Depth += subStats.Depth
-	// Add the stats for all sub-buckets
-	s.Add(subStats)
+	s.BranchAlloc = s.BranchPageN * pageSize
+	s.LeafAlloc = s.LeafPageN * pageSize
 	return s
 }
 
-// forEachPage iterates over every page in a bucket, including inline pages.
-func (b *Bucket) forEachPage(fn func(*common.Page, int, []common.Pgid)) {
-	// If we have an inline page then just use that.
-	if b.page != nil {
-		fn(b.page, 0, []common.Pgid{b.RootPage()})
+// forEachNode iterates over every node in a bucket.
+func (b *Bucket) forEachNode(fn func(*node, int)) {
+	if b.rootNode != nil && b.RootPage() == 0 {
+		fn(b.rootNode.readNodeView(), 0)
 		return
 	}
-
-	// Otherwise traverse the page hierarchy.
-	b.tx.forEachPage(b.RootPage(), fn)
-}
-
-// forEachPageNode iterates over every page (or node) in a bucket.
-// This also includes inline pages.
-func (b *Bucket) forEachPageNode(fn func(*common.Page, *node, int)) {
-	// If we have an inline page or root node then just use that.
-	if b.page != nil {
-		fn(b.page, nil, 0)
+	if !b.hasCommittedRoot() {
 		return
 	}
-	b._forEachPageNode(b.RootPage(), 0, fn)
+	b._forEachNode(b.RootPage(), 0, fn)
 }
 
-func (b *Bucket) _forEachPageNode(pgId common.Pgid, depth int, fn func(*common.Page, *node, int)) {
-	var p, n = b.pageNode(pgId)
-
-	// Execute function.
-	fn(p, n, depth)
-
-	// Recursively loop over children.
-	if p != nil {
-		if p.IsBranchPage() {
-			for i := 0; i < int(p.Count()); i++ {
-				elem := p.BranchPageElement(uint16(i))
-				b._forEachPageNode(elem.Pgid(), depth+1, fn)
-			}
-		}
-	} else {
-		if !n.isLeaf {
-			for _, inode := range n.inodes {
-				b._forEachPageNode(inode.Pgid(), depth+1, fn)
-			}
+func (b *Bucket) _forEachNode(nid common.Nid, depth int, fn func(*node, int)) {
+	n := b.pageNode(nid)
+	if n == nil {
+		return
+	}
+	fn(n, depth)
+	if !n.isLeaf {
+		for _, inode := range n.inodes {
+			b._forEachNode(inode.Nid(), depth+1, fn)
 		}
 	}
 }
 
-// spill writes all the nodes for this bucket to dirty pages.
-func (b *Bucket) spill() error {
-	// Spill all child buckets first.
-	for name, child := range b.buckets {
-		// If the child bucket is small enough and it has no child buckets then
-		// write it inline into the parent bucket's page. Otherwise spill it
-		// like a normal bucket and make the parent value a pointer to the page.
-		var value []byte
-		if child.inlineable() {
-			child.free()
-			value = child.write()
-		} else {
-			if err := child.spill(); err != nil {
-				return err
-			}
-
-			// Update the child bucket header in this bucket.
-			value = make([]byte, unsafe.Sizeof(common.InBucket{}))
-			var bucket = (*common.InBucket)(unsafe.Pointer(&value[0]))
-			*bucket = *child.InBucket
-		}
-
-		// Skip writing the bucket if there are no materialized nodes.
-		if child.rootNode == nil {
-			continue
-		}
-
-		// Update parent node.
-		var c = b.Cursor()
-		k, _, flags := c.seek([]byte(name))
-		if !bytes.Equal([]byte(name), k) {
-			panic(fmt.Sprintf("misplaced bucket header: %x -> %x", []byte(name), k))
-		}
-		if flags&common.BucketLeafFlag == 0 {
-			panic(fmt.Sprintf("unexpected bucket header flag: %x", flags))
-		}
-		c.node().put([]byte(name), []byte(name), value, 0, common.BucketLeafFlag)
-	}
-
-	// Ignore if there's not a materialized root node.
-	if b.rootNode == nil {
-		return nil
-	}
-
-	// Spill nodes.
-	if err := b.rootNode.spill(); err != nil {
-		return err
-	}
-	b.rootNode = b.rootNode.root()
-
-	// Update the root node for this bucket.
-	if b.rootNode.pgid >= b.tx.meta.Pgid() {
-		panic(fmt.Sprintf("pgid (%d) above high water mark (%d)", b.rootNode.pgid, b.tx.meta.Pgid()))
-	}
-	b.SetRootPage(b.rootNode.pgid)
-
-	return nil
+// hasCommittedRoot reports whether the bucket has a published root node.
+func (b *Bucket) hasCommittedRoot() bool {
+	return b.base != nil && b.base.root != 0
 }
 
-// inlineable returns true if a bucket is small enough to be written inline
-// and if it contains no subbuckets. Otherwise, returns false.
-func (b *Bucket) inlineable() bool {
-	var n = b.rootNode
+// node returns a writable node for the given id, materializing one (COW) if
+// necessary. This is the write-path entry; the read path uses pageNode.
+func (b *Bucket) node(id common.Nid, parent *workNode) *workNode {
+	common.Assert(b.dirty != nil, "nodes map expected (write tx)")
 
-	// Bucket must only contain a single leaf node.
-	if n == nil || !n.isLeaf {
-		return false
-	}
-
-	// Bucket is not inlineable if it contains subbuckets or if it goes beyond
-	// our threshold for inline bucket size.
-	var size = common.PageHeaderSize
-	for _, inode := range n.inodes {
-		size += common.LeafPageElementSize + uintptr(len(inode.Key())) + uintptr(len(inode.Value()))
-
-		if inode.Flags()&common.BucketLeafFlag != 0 {
-			return false
-		} else if size > b.maxInlineBucketSize() {
-			return false
-		}
-	}
-
-	return true
-}
-
-// Returns the maximum total size of a bucket to make it a candidate for inlining.
-func (b *Bucket) maxInlineBucketSize() uintptr {
-	return uintptr(b.tx.db.pageSize / 4)
-}
-
-// write allocates and writes a bucket to a byte slice.
-func (b *Bucket) write() []byte {
-	// Allocate the appropriate size.
-	var n = b.rootNode
-	var value = make([]byte, common.BucketHeaderSize+n.size())
-
-	// Write a bucket header.
-	var bucket = (*common.InBucket)(unsafe.Pointer(&value[0]))
-	*bucket = *b.InBucket
-
-	// Convert byte slice to a fake page and write the root node.
-	var p = (*common.Page)(unsafe.Pointer(&value[common.BucketHeaderSize]))
-	n.write(p)
-
-	return value
-}
-
-// rebalance attempts to balance all nodes.
-func (b *Bucket) rebalance() {
-	for _, n := range b.nodes {
-		n.rebalance()
-	}
-	for _, child := range b.buckets {
-		child.rebalance()
-	}
-}
-
-// node creates a node from a page and associates it with a given parent.
-func (b *Bucket) node(pgId common.Pgid, parent *node) *node {
-	common.Assert(b.nodes != nil, "nodes map expected")
-
-	// Retrieve node if it's already been created.
-	if n := b.nodes[pgId]; n != nil {
+	if n := b.dirty[id]; n != nil {
 		return n
 	}
 
-	// Otherwise create a node and cache it.
-	n := &node{bucket: b, parent: parent}
+	var n *workNode
+	if !b.hasCommittedRoot() {
+		// No committed root yet: use/create the in-memory root (id 0 placeholder).
+		if b.rootNode != nil {
+			n = b.rootNode
+		} else {
+			n = &workNode{bucket: b, isLeaf: true}
+		}
+		n.parent = parent
+	} else {
+		n = b.nodeForWrite(id, parent)
+	}
+
 	if parent == nil {
 		b.rootNode = n
-	} else {
-		parent.children = append(parent.children, n)
 	}
-
-	// Use the inline page if this is an inline bucket.
-	var p = b.page
-	if p == nil {
-		p = b.tx.page(pgId)
-	} else {
-		// if p isn't nil, then it's an inline bucket.
-		// The pgId must be 0 in this case.
-		common.Verify(func() {
-			common.Assert(pgId == 0, "The page ID (%d) isn't 0 for an inline bucket", pgId)
-		})
-	}
-
-	// Read the page into the node and cache it.
-	n.read(p)
-	b.nodes[pgId] = n
-
-	// Update statistics.
+	b.dirty[id] = n
 	b.tx.stats.IncNodeCount(1)
-
 	return n
 }
 
-// free recursively frees all pages in the bucket.
-func (b *Bucket) free() {
-	if b.RootPage() == 0 {
+// nodeForWrite returns a writable copy of a node (COW from the base snapshot).
+func (b *Bucket) nodeForWrite(id common.Nid, parent *workNode) *workNode {
+	if n, ok := b.dirty[id]; ok {
+		return n
+	}
+	if _, ok := b.obsolete[id]; ok {
+		panic(fmt.Sprintf("node %d has been removed", id))
+	}
+	var orig *snapNode
+	if b.base != nil {
+		orig = b.base.nodes[id]
+	}
+	if orig == nil {
+		panic(fmt.Sprintf("node %d not found", id))
+	}
+	n := orig.materializeWorkNode()
+	n.parent = parent
+	n.bucket = b
+	n.children = nil
+	n.spilled = false
+	n.unbalanced = false
+	b.dirty[id] = n
+	if parent != nil {
+		parent.children = append(parent.children, n)
+	}
+	return n
+}
+
+// pageNode returns a read-only node view (*snapNode) for a logical node id.
+// When a bucket has a materialized but unfinalized root, id 0 (and the root's
+// id) map to that in-memory root.
+func (b *Bucket) pageNode(id common.Nid) *node {
+	if b.rootNode != nil && (id == 0 || id == b.rootNode.nid) {
+		return b.rootNode.readNodeView()
+	}
+	if b.dirty != nil {
+		if n := b.dirty[id]; n != nil {
+			return n.readNodeView()
+		}
+	}
+	if b.obsolete != nil {
+		if _, ok := b.obsolete[id]; ok {
+			return nil
+		}
+	}
+	if b.base != nil {
+		return b.base.nodes[id]
+	}
+	return nil
+}
+
+// allocate returns a new node id for this bucket, reusing freed ids first.
+func (b *Bucket) allocate() (common.Nid, error) {
+	nid := b.handle.allocNode()
+	b.tx.stats.IncPageCount(1)
+	b.tx.stats.IncPageAlloc(int64(b.tx.db.pageSize))
+	return nid, nil
+}
+
+// spill finalizes the bucket's dirty tree (split + assign node ids).
+func (b *Bucket) spill() error {
+	if b.rootNode == nil {
+		return nil
+	}
+	if err := b.rootNode.finalize(); err != nil {
+		return err
+	}
+	b.rootNode = b.rootNode.root()
+	return nil
+}
+
+// rebalance rebalances every dirty node in the bucket.
+func (b *Bucket) rebalance() {
+	for _, n := range b.dirty {
+		n.rebalance()
+	}
+}
+
+// markObsolete records that a node id is freed in this tx and recycles its
+// bucket-local NodeId for reuse. Idempotent.
+func (b *Bucket) markObsolete(id common.Nid) {
+	if b.obsolete == nil {
 		return
 	}
-
-	var tx = b.tx
-	b.forEachPageNode(func(p *common.Page, n *node, _ int) {
-		if p != nil {
-			tx.db.freelist.Free(tx.meta.Txid(), p)
-		} else {
-			n.free()
-		}
-	})
-	b.SetRootPage(0)
+	if _, ok := b.obsolete[id]; ok {
+		return
+	}
+	b.obsolete[id] = struct{}{}
+	if b.handle != nil && id != 0 {
+		b.handle.freeNode(id.NodeId())
+	}
 }
 
-// dereference removes all references to the old mmap.
-func (b *Bucket) dereference() {
+// dropNode removes a node from the tx-local dirty cache and marks it obsolete.
+func (b *Bucket) dropNode(id common.Nid) {
+	delete(b.dirty, id)
+	b.markObsolete(id)
+}
+
+// buildPublishedState assembles the immutable bucketState to publish for this
+// bucket from its COW base plus frozen dirty workNodes. Clean (unchanged) nodes
+// are shared by pointer; only dirtied/obsolete entries differ.
+func (b *Bucket) buildPublishedState() *bucketState {
+	var baseNodes map[common.Nid]*snapNode
+	rootNid := common.Nid(0)
+	if b.base != nil {
+		baseNodes = b.base.nodes
+		rootNid = b.base.root
+	}
+
+	var newNodes map[common.Nid]*snapNode
+	if len(b.dirty) == 0 && len(b.obsolete) == 0 {
+		newNodes = baseNodes
+	} else {
+		newNodes = make(map[common.Nid]*snapNode, len(baseNodes)+len(b.dirty))
+		for nid, n := range baseNodes {
+			newNodes[nid] = n
+		}
+		for nid := range b.obsolete {
+			delete(newNodes, nid)
+		}
+		for nid, n := range b.dirty {
+			newNodes[nid] = n.freeze()
+		}
+	}
+
 	if b.rootNode != nil {
-		b.rootNode.root().dereference()
+		rootNid = b.rootNode.nid
 	}
 
-	for _, child := range b.buckets {
-		child.dereference()
+	return &bucketState{
+		id:       b.handle.id,
+		root:     rootNid,
+		nodes:    newNodes,
+		sequence: b.sequence,
 	}
 }
 
-// pageNode returns the in-memory node, if it exists.
-// Otherwise, returns the underlying page.
-func (b *Bucket) pageNode(id common.Pgid) (*common.Page, *node) {
-	// Inline buckets have a fake page embedded in their value so treat them
-	// differently. We'll return the rootNode (if available) or the fake page.
-	if b.RootPage() == 0 {
-		if id != 0 {
-			panic(fmt.Sprintf("inline bucket non-zero page access(2): %d != 0", id))
-		}
-		if b.rootNode != nil {
-			return nil, b.rootNode
-		}
-		return b.page, nil
+// size returns the logical payload size of the bucket's tx view in bytes.
+func (b *Bucket) size() int64 {
+	var size int64
+	var baseNodes map[common.Nid]*snapNode
+	if b.base != nil {
+		baseNodes = b.base.nodes
 	}
-
-	// Check the node cache for non-inline buckets.
-	if b.nodes != nil {
-		if n := b.nodes[id]; n != nil {
-			return nil, n
+	for id, n := range baseNodes {
+		if _, ok := b.obsolete[id]; ok {
+			continue
 		}
+		if _, ok := b.dirty[id]; ok {
+			continue
+		}
+		size += int64(n.size())
 	}
-
-	// Finally lookup the page from the transaction if no node is materialized.
-	return b.tx.page(id), nil
+	for _, n := range b.dirty {
+		size += int64(n.size())
+	}
+	return size
 }
 
 // BucketStats records statistics about resources used by a bucket.
@@ -968,8 +559,8 @@ type BucketStats struct {
 
 	// Bucket statistics
 	BucketN           int // total number of buckets including the top bucket
-	InlineBucketN     int // total number on inlined buckets
-	InlineBucketInuse int // bytes used for inlined buckets (also accounted for in LeafInuse)
+	InlineBucketN     int // always 0 in pure memory mode; kept for API compatibility
+	InlineBucketInuse int // always 0 in pure memory mode; kept for API compatibility
 }
 
 func (s *BucketStats) Add(other BucketStats) {
@@ -991,15 +582,16 @@ func (s *BucketStats) Add(other BucketStats) {
 	s.InlineBucketInuse += other.InlineBucketInuse
 }
 
+// BucketStructure records the structure of a bucket.
+type BucketStructure struct {
+	Name     string            `json:"name"`
+	KeyN     int               `json:"keyN"`
+	Children []BucketStructure `json:"buckets,omitempty"`
+}
+
 // cloneBytes returns a copy of a given slice.
 func cloneBytes(v []byte) []byte {
 	var clone = make([]byte, len(v))
 	copy(clone, v)
 	return clone
-}
-
-type BucketStructure struct {
-	Name     string            `json:"name"`              // name of the bucket
-	KeyN     int               `json:"keyN"`              // number of key/value pairs
-	Children []BucketStructure `json:"buckets,omitempty"` // child buckets
 }

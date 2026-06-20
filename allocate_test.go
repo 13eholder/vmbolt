@@ -4,36 +4,33 @@ import (
 	"testing"
 
 	"13eholder/vmbolt/internal/common"
-	"13eholder/vmbolt/internal/freelist"
 )
 
-func TestTx_allocatePageStats(t *testing.T) {
-	for n, f := range map[string]freelist.Interface{"hashmap": freelist.NewHashMapFreelist(), "array": freelist.NewArrayFreelist()} {
-		t.Run(n, func(t *testing.T) {
-			ids := []common.Pgid{2, 3}
-			f.Init(ids)
+// TestBucketHandle_AllocFreeRecycle exercises the per-bucket node-id allocator:
+// ids carry the bucket's prefix, freed ids are reused (LIFO), and the monotonic
+// counter only advances when the freelist is empty.
+func TestBucketHandle_AllocFreeRecycle(t *testing.T) {
+	h := &bucketHandle{id: common.BucketId(7)}
 
-			tx := &Tx{
-				db: &DB{
-					freelist: f,
-					pageSize: common.DefaultPageSize,
-				},
-				meta:  &common.Meta{},
-				pages: make(map[common.Pgid]*common.Page),
-			}
+	n0 := h.allocNode()
+	n1 := h.allocNode()
+	if n0.NodeId() != 0 || n1.NodeId() != 1 {
+		t.Fatalf("expected node ids 0,1; got %d,%d", n0.NodeId(), n1.NodeId())
+	}
+	if n0.BucketOf() != 7 || n1.BucketOf() != 7 {
+		t.Fatalf("nid bucket prefix wrong: %d,%d", n0.BucketOf(), n1.BucketOf())
+	}
 
-			txStats := tx.Stats()
-			prePageCnt := txStats.GetPageCount()
-			allocateCnt := f.FreeCount()
+	// Free node 0, then allocate: the freed id must come back (LIFO).
+	h.freeNode(0)
+	n2 := h.allocNode()
+	if n2.NodeId() != 0 {
+		t.Fatalf("expected recycled node id 0; got %d", n2.NodeId())
+	}
 
-			if _, err := tx.allocate(allocateCnt); err != nil {
-				t.Fatal(err)
-			}
-
-			txStats = tx.Stats()
-			if txStats.GetPageCount() != prePageCnt+int64(allocateCnt) {
-				t.Errorf("Allocated %d but got %d page in stats", allocateCnt, txStats.GetPageCount())
-			}
-		})
+	// Freelist empty again: next alloc advances the counter (2, not reused).
+	n3 := h.allocNode()
+	if n3.NodeId() != 2 {
+		t.Fatalf("expected fresh node id 2; got %d", n3.NodeId())
 	}
 }

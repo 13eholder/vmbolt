@@ -1,6 +1,6 @@
 package version
 
 var (
-	// Version shows the last bbolt binary version released.
-	Version = "1.4.3"
+	// Version shows the last vmbolt binary version released.
+	Version = "0.1-alpha"
 )

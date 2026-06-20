@@ -1,13 +1,8 @@
 package vmbolt
 
 import (
-	"errors"
-	"fmt"
-	"io"
 	"os"
-	"runtime"
 	"sort"
-	"strings"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -17,59 +12,43 @@ import (
 )
 
 // Tx represents a read-only or read/write transaction on the database.
-// Read-only transactions can be used for retrieving values for keys and creating cursors.
-// Read/write transactions can create and remove buckets and create and remove keys.
 //
-// IMPORTANT: You must commit or rollback transactions when you are done with
-// them. Pages can not be reclaimed by the writer until no more transactions
-// are using them. A long running read transaction can cause the database to
-// quickly grow.
+// In the per-bucket model a Tx does not hold a global snapshot. Instead it
+// lazily opens a per-bucket context (*Bucket) on first access. A read Tx pins
+// each touched bucket's current generation (per-bucket snapshot isolation); a
+// write Tx accumulates dirty workNodes per touched bucket and publishes each
+// touched bucket independently at commit. There is deliberately no
+// cross-bucket atomicity.
 type Tx struct {
-	writable       bool
-	managed        bool
-	db             *DB
-	meta           *common.Meta
-	root           Bucket
-	pages          map[common.Pgid]*common.Page
+	writable bool
+	managed  bool
+	db       *DB
+	id       common.Txid
+
+	// Per-bucket tx-local contexts, created lazily by Bucket/CreateBucket/etc.
+	bctx map[string]*Bucket
+
+	// Pending bucket-directory mutations, applied at commit (build-all-then-publish-all).
+	created map[string]*bucketHandle
+	deleted map[string]struct{}
+
+	// Cohort bookkeeping. cohortSnaps pins (per read tx) one cohortSnapshot per
+	// cohort so all its members are read from one generation. dirtyCohorts /
+	// adoptedStates drive write-tx cohort (re)publishing.
+	cohortSnaps   map[*bucketCohort]*cohortSnapshot
+	dirtyCohorts  map[*bucketCohort]struct{}
+	adoptedStates map[string]*bucketState // existing independent buckets adopted into a cohort this tx
+
 	stats          TxStats
 	commitHandlers []func()
-
-	// WriteFlag specifies the flag for write-related methods like WriteTo().
-	// Tx opens the database file with the specified flag to copy the data.
-	//
-	// By default, the flag is unset, which works well for mostly in-memory
-	// workloads. For databases that are much larger than available RAM,
-	// set the flag to syscall.O_DIRECT to avoid trashing the page cache.
-	WriteFlag int
-}
-
-// init initializes the transaction.
-func (tx *Tx) init(db *DB) {
-	tx.db = db
-	tx.pages = nil
-
-	// Copy the meta page since it can be changed by the writer.
-	tx.meta = &common.Meta{}
-	db.meta().Copy(tx.meta)
-
-	// Copy over the root bucket.
-	tx.root = newBucket(tx)
-	tx.root.InBucket = &common.InBucket{}
-	*tx.root.InBucket = *(tx.meta.RootBucket())
-
-	// Increment the transaction id and add a page cache for writable transactions.
-	if tx.writable {
-		tx.pages = make(map[common.Pgid]*common.Page)
-		tx.meta.IncTxid()
-	}
 }
 
 // ID returns the transaction id.
 func (tx *Tx) ID() int {
-	if tx == nil || tx.meta == nil {
+	if tx == nil {
 		return -1
 	}
-	return int(tx.meta.Txid())
+	return int(tx.id)
 }
 
 // DB returns a reference to the database that created the transaction.
@@ -77,22 +56,9 @@ func (tx *Tx) DB() *DB {
 	return tx.db
 }
 
-// Size returns current database size in bytes as seen by this transaction.
-func (tx *Tx) Size() int64 {
-	return int64(tx.meta.Pgid()) * int64(tx.db.pageSize)
-}
-
 // Writable returns whether the transaction can perform write operations.
 func (tx *Tx) Writable() bool {
 	return tx.writable
-}
-
-// Cursor creates a cursor associated with the root bucket.
-// All items in the cursor will return a nil value because all root bucket keys point to buckets.
-// The cursor is only valid as long as the transaction is open.
-// Do not use a cursor after the transaction is closed.
-func (tx *Tx) Cursor() *Cursor {
-	return tx.root.Cursor()
 }
 
 // Stats retrieves a copy of the current transaction statistics.
@@ -100,63 +66,241 @@ func (tx *Tx) Stats() TxStats {
 	return tx.stats
 }
 
-// Inspect returns the structure of the database.
+// Size returns the logical payload size of the whole database view in bytes
+// (the sum of every bucket's node-content estimate, using the tx-local view for
+// buckets touched by this tx and the committed generation for the rest). It is
+// an in-memory estimate, not a persisted file size.
+func (tx *Tx) Size() int64 {
+	var size int64
+	seen := make(map[string]bool, len(tx.bctx))
+
+	// Committed buckets.
+	tx.db.bucketsMu.RLock()
+	type committed struct {
+		name string
+		h    *bucketHandle
+	}
+	committedBuckets := make([]committed, 0, len(tx.db.buckets))
+	for n, h := range tx.db.buckets {
+		committedBuckets = append(committedBuckets, committed{n, h})
+	}
+	tx.db.bucketsMu.RUnlock()
+	for _, c := range committedBuckets {
+		seen[c.name] = true
+		if b := tx.bctx[c.name]; b != nil {
+			size += b.size() // tx-local view (dirty/base/obsolete)
+			continue
+		}
+		if st := publishedStateOf(c.h); st != nil {
+			for _, sn := range st.nodes {
+				size += int64(sn.size())
+			}
+		}
+	}
+	// Buckets created in this tx (not yet in db.buckets).
+	for name, b := range tx.bctx {
+		if seen[name] {
+			continue
+		}
+		size += b.size()
+	}
+	return size
+}
+
+// Inspect returns the structure of the database: a synthetic "root" whose
+// children are the top-level buckets. (There is no real root bucket in the
+// per-bucket model; this aggregates for diagnostic compatibility.)
 func (tx *Tx) Inspect() BucketStructure {
-	return tx.root.Inspect()
+	root := BucketStructure{Name: "root"}
+	_ = tx.ForEach(func(name []byte, b *Bucket) error {
+		root.Children = append(root.Children, b.Inspect())
+		return nil
+	})
+	return root
 }
 
-// Bucket retrieves a bucket by name.
-// Returns nil if the bucket does not exist.
-// The bucket instance is only valid for the lifetime of the transaction.
+// Cursor returns a directory cursor over the top-level bucket NAMES in sorted
+// (lexicographic) order. It yields (bucketName, nil) per entry; use tx.Bucket(name)
+// to open the bucket itself. This replaces the legacy root-bucket cursor and keeps
+// enumeration deterministic (required by Hash/snapshot/defrag-style callers).
+func (tx *Tx) Cursor() *Cursor {
+	if tx.db == nil {
+		return &Cursor{}
+	}
+	// Snapshot the bucket-name set (committed ∪ created − deleted) and sort it.
+	nameSet := map[string]struct{}{}
+	tx.db.bucketsMu.RLock()
+	for n := range tx.db.buckets {
+		nameSet[n] = struct{}{}
+	}
+	tx.db.bucketsMu.RUnlock()
+	for n := range tx.created {
+		nameSet[n] = struct{}{}
+	}
+	for n := range tx.deleted {
+		delete(nameSet, n)
+	}
+	names := make([]string, 0, len(nameSet))
+	for n := range nameSet {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	dir := make([][]byte, len(names))
+	for i, n := range names {
+		dir[i] = []byte(n)
+	}
+	return &Cursor{dir: dir, dirIdx: -1}
+}
+
+// Bucket retrieves a top-level bucket by name, opening a tx-local context for
+// it. For a read Tx the bucket's current generation is pinned (per-bucket
+// snapshot isolation); for a write Tx a dirty set is initialized and the
+// bucket's allocator state is snapshotted for rollback. Returns nil if the
+// bucket does not exist.
 func (tx *Tx) Bucket(name []byte) *Bucket {
-	return tx.root.Bucket(name)
+	if tx.db == nil {
+		return nil
+	}
+	key := string(name)
+	if b := tx.bctx[key]; b != nil {
+		return b
+	}
+	if _, ok := tx.deleted[key]; ok {
+		return nil
+	}
+	if h := tx.created[key]; h != nil {
+		b := newBucketForHandle(tx, key, h)
+		tx.putBctx(key, b)
+		return b
+	}
+	tx.db.bucketsMu.RLock()
+	h := tx.db.buckets[key]
+	tx.db.bucketsMu.RUnlock()
+	if h == nil {
+		return nil
+	}
+	b := newBucketForHandle(tx, key, h)
+	tx.putBctx(key, b)
+	return b
 }
 
-// CreateBucket creates a new bucket.
-// Returns an error if the bucket already exists, if the bucket name is blank, or if the bucket name is too long.
-// The bucket instance is only valid for the lifetime of the transaction.
+// CreateBucket creates a new top-level bucket and returns a tx-local handle to
+// it. The bucket is usable immediately within this tx; it is registered in the
+// DB directory at commit.
 func (tx *Tx) CreateBucket(name []byte) (*Bucket, error) {
-	return tx.root.CreateBucket(name)
+	if tx.db == nil {
+		return nil, berrors.ErrTxClosed
+	}
+	if !tx.writable {
+		return nil, berrors.ErrTxNotWritable
+	}
+	if len(name) == 0 {
+		return nil, berrors.ErrBucketNameRequired
+	}
+	key := string(name)
+	if _, deleted := tx.deleted[key]; !deleted {
+		if tx.created[key] != nil || tx.bucketExistsCommitted(key) {
+			return nil, berrors.ErrBucketExists
+		}
+	}
+	id := tx.db.allocBucketId()
+	h := &bucketHandle{id: id, name: key}
+	b := &Bucket{
+		tx:          tx,
+		name:        key,
+		handle:      h,
+		dirty:       make(map[common.Nid]*workNode),
+		obsolete:    make(map[common.Nid]struct{}),
+		FillPercent: DefaultFillPercent,
+	}
+	b.rootNode = &workNode{bucket: b, isLeaf: true}
+	if tx.created == nil {
+		tx.created = make(map[string]*bucketHandle)
+	}
+	tx.created[key] = h
+	delete(tx.deleted, key) // a delete-then-recreate cancels the deletion
+	tx.putBctx(key, b)
+	return b, nil
 }
 
 // CreateBucketIfNotExists creates a new bucket if it doesn't already exist.
-// Returns an error if the bucket name is blank, or if the bucket name is too long.
-// The bucket instance is only valid for the lifetime of the transaction.
 func (tx *Tx) CreateBucketIfNotExists(name []byte) (*Bucket, error) {
-	return tx.root.CreateBucketIfNotExists(name)
+	if tx.db == nil {
+		return nil, berrors.ErrTxClosed
+	}
+	if !tx.writable {
+		return nil, berrors.ErrTxNotWritable
+	}
+	if len(name) == 0 {
+		return nil, berrors.ErrBucketNameRequired
+	}
+	if b := tx.Bucket(name); b != nil {
+		return b, nil
+	}
+	return tx.CreateBucket(name)
 }
 
-// DeleteBucket deletes a bucket.
-// Returns an error if the bucket cannot be found or if the key represents a non-bucket value.
+// DeleteBucket deletes a top-level bucket. The whole tree is discarded at
+// commit; no per-node freeing is needed.
 func (tx *Tx) DeleteBucket(name []byte) error {
-	return tx.root.DeleteBucket(name)
+	if tx.db == nil {
+		return berrors.ErrTxClosed
+	}
+	if !tx.writable {
+		return berrors.ErrTxNotWritable
+	}
+	key := string(name)
+	if tx.created[key] != nil {
+		// Created and deleted in the same tx: cancel the creation.
+		delete(tx.created, key)
+		delete(tx.bctx, key)
+		return nil
+	}
+	if !tx.bucketExistsCommitted(key) {
+		return berrors.ErrBucketNotFound
+	}
+	if tx.deleted == nil {
+		tx.deleted = make(map[string]struct{})
+	}
+	tx.deleted[key] = struct{}{}
+	delete(tx.bctx, key)
+	return nil
 }
 
-// MoveBucket moves a sub-bucket from the source bucket to the destination bucket.
-// Returns an error if
-//  1. the sub-bucket cannot be found in the source bucket;
-//  2. or the key already exists in the destination bucket;
-//  3. the key represents a non-bucket value.
-//
-// If src is nil, it means moving a top level bucket into the target bucket.
-// If dst is nil, it means converting the child bucket into a top level bucket.
+// MoveBucket is not supported in the flat per-bucket model: buckets are all
+// top-level and indexed directly by name.
 func (tx *Tx) MoveBucket(child []byte, src *Bucket, dst *Bucket) error {
-	if src == nil {
-		src = &tx.root
-	}
-	if dst == nil {
-		dst = &tx.root
-	}
-	return src.MoveBucket(child, dst)
+	_ = child
+	_ = src
+	_ = dst
+	return berrors.ErrNestedBucketsUnsupported
 }
 
-// ForEach executes a function for each bucket in the root.
-// If the provided function returns an error then the iteration is stopped and
-// the error is returned to the caller.
+// ForEach executes a function for each top-level bucket.
 func (tx *Tx) ForEach(fn func(name []byte, b *Bucket) error) error {
-	return tx.root.ForEach(func(k, v []byte) error {
-		return fn(k, tx.root.Bucket(k))
-	})
+	if tx.db == nil {
+		return berrors.ErrTxClosed
+	}
+	tx.db.bucketsMu.RLock()
+	names := make([]string, 0, len(tx.db.buckets))
+	for n := range tx.db.buckets {
+		names = append(names, n)
+	}
+	tx.db.bucketsMu.RUnlock()
+	for _, n := range names {
+		if _, ok := tx.deleted[n]; ok {
+			continue
+		}
+		if err := fn([]byte(n), tx.Bucket([]byte(n))); err != nil {
+			return err
+		}
+	}
+	for n := range tx.created {
+		if err := fn([]byte(n), tx.Bucket([]byte(n))); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // OnCommit adds a handler function to be executed after the transaction successfully commits.
@@ -164,9 +308,36 @@ func (tx *Tx) OnCommit(fn func()) {
 	tx.commitHandlers = append(tx.commitHandlers, fn)
 }
 
-// Commit writes all changes to disk, updates the meta page and closes the transaction.
-// Returns an error if a disk write error occurs, or if Commit is
-// called on a read-only transaction.
+// bucketExistsCommitted reports whether a bucket name exists in the DB
+// directory (ignoring this tx's pending create/delete).
+func (tx *Tx) bucketExistsCommitted(key string) bool {
+	tx.db.bucketsMu.RLock()
+	_, ok := tx.db.buckets[key]
+	tx.db.bucketsMu.RUnlock()
+	return ok
+}
+
+func (tx *Tx) putBctx(key string, b *Bucket) {
+	if tx.bctx == nil {
+		tx.bctx = make(map[string]*Bucket)
+	}
+	tx.bctx[key] = b
+}
+
+// Commit publishes each touched bucket. Independent buckets are published one
+// atomic Store each (per-bucket snapshot isolation). Buckets that share a cohort
+// (see Tx.AssignCohort) are published together via one cohort-snapshot Store, so
+// cohort members become visible atomically — no reader can see one member at a
+// newer generation than another.
+//
+// Pipeline:
+//  1. rebalance + spill (finalize) every touched bucket, assigning node ids;
+//  2. build each bucket's new immutable bucketState;
+//  3. publish under bucketsMu: independent buckets per-handle, dirty cohorts as
+//     rebuilt joint snapshots, plus pending create/delete.
+//
+// Steps 1-2 perform no publication, so a failure leaves nothing published and
+// the tx rolls back cleanly.
 func (tx *Tx) Commit() (err error) {
 	txId := tx.ID()
 	lg := tx.db.Logger()
@@ -184,92 +355,106 @@ func (tx *Tx) Commit() (err error) {
 	common.Assert(!tx.managed, "managed tx commit not allowed")
 	if tx.db == nil {
 		return berrors.ErrTxClosed
-	} else if !tx.writable {
+	}
+	if !tx.writable {
 		return berrors.ErrTxNotWritable
 	}
 
-	// TODO(benbjohnson): Use vectorized I/O to write out dirty pages.
-
-	// Rebalance nodes which have had deletions.
-	var startTime = time.Now()
-	tx.root.rebalance()
+	// Step 1: rebalance then spill each touched bucket.
+	startTime := time.Now()
+	for _, b := range tx.bctx {
+		b.rebalance()
+	}
 	if tx.stats.GetRebalance() > 0 {
 		tx.stats.IncRebalanceTime(time.Since(startTime))
 	}
 
-	opgid := tx.meta.Pgid()
-
-	// spill data onto dirty pages.
 	startTime = time.Now()
-	if err = tx.root.spill(); err != nil {
-		lg.Errorf("spilling data onto dirty pages failed: %v", err)
-		tx.rollback()
-		return err
-	}
-	tx.stats.IncSpillTime(time.Since(startTime))
-
-	// Free the old root bucket.
-	tx.meta.RootBucket().SetRootPage(tx.root.RootPage())
-
-	// Free the old freelist because commit writes out a fresh freelist.
-	if tx.meta.Freelist() != common.PgidNoFreelist {
-		tx.db.freelist.Free(tx.meta.Txid(), tx.db.page(tx.meta.Freelist()))
-	}
-
-	if !tx.db.NoFreelistSync {
-		err = tx.commitFreelist()
-		if err != nil {
-			lg.Errorf("committing freelist failed: %v", err)
-			return err
-		}
-	} else {
-		tx.meta.SetFreelist(common.PgidNoFreelist)
-	}
-
-	// If the high water mark has moved up then attempt to grow the database.
-	if tx.meta.Pgid() > opgid {
-		_ = errors.New("")
-		// gofail: var lackOfDiskSpace string
-		// tx.rollback()
-		// return errors.New(lackOfDiskSpace)
-		if err = tx.db.grow(int(tx.meta.Pgid()+1) * tx.db.pageSize); err != nil {
-			lg.Errorf("growing db size failed, pgid: %d, pagesize: %d, error: %v", tx.meta.Pgid(), tx.db.pageSize, err)
+	for _, b := range tx.bctx {
+		if err = b.spill(); err != nil {
+			lg.Errorf("spilling bucket %q failed: %v", b.name, err)
 			tx.rollback()
 			return err
 		}
 	}
+	tx.stats.IncSpillTime(time.Since(startTime))
 
-	// Write dirty pages to disk.
-	startTime = time.Now()
-	if err = tx.write(); err != nil {
-		lg.Errorf("writing data failed: %v", err)
-		tx.rollback()
-		return err
+	// Step 2: build the new published state for each touched bucket.
+	type pending struct {
+		handle *bucketHandle
+		state  *bucketState
+		isNew  bool
+	}
+	pendings := make([]pending, 0, len(tx.bctx))
+	for _, b := range tx.bctx {
+		_, isNew := tx.created[b.name]
+		pendings = append(pendings, pending{
+			handle: b.handle,
+			state:  b.buildPublishedState(),
+			isNew:  isNew,
+		})
 	}
 
-	// If strict mode is enabled then perform a consistency check.
-	if tx.db.StrictMode {
-		ch := tx.Check()
-		var errs []string
-		for {
-			chkErr, ok := <-ch
-			if !ok {
-				break
+	// Step 3: publish under the directory lock.
+	//   - touched INDEPENDENT buckets: per-handle atomic Store;
+	//   - each dirty cohort: rebuild its jointly-published snapshot (members at
+	//     their new state if touched/adopted this tx, else carried forward) and
+	//     Store it once, so all members become visible atomically together.
+	newStates := make(map[string]*bucketState, len(pendings)+len(tx.adoptedStates))
+	for _, p := range pendings {
+		newStates[p.handle.name] = p.state
+	}
+	for name, st := range tx.adoptedStates {
+		if _, ok := newStates[name]; !ok {
+			newStates[name] = st
+		}
+	}
+	// Any touched/adopted cohort member must trigger its cohort's joint republish.
+	for _, p := range pendings {
+		if p.handle.cohort != nil {
+			tx.markCohortDirty(p.handle.cohort)
+		}
+	}
+
+	tx.db.bucketsMu.Lock()
+	// 3a. register created buckets.
+	for _, p := range pendings {
+		if p.isNew {
+			tx.db.buckets[p.handle.name] = p.handle
+		}
+	}
+	// 3b. apply deletes; mark any cohort dirty so its snapshot drops the member.
+	for name := range tx.deleted {
+		if h := tx.db.buckets[name]; h != nil {
+			if h.cohort != nil {
+				tx.markCohortDirty(h.cohort)
 			}
-			errs = append(errs, chkErr.Error())
-		}
-		if len(errs) > 0 {
-			panic("check fail: " + strings.Join(errs, "\n"))
+			delete(tx.db.buckets, name)
+			tx.db.freeBucketId(h.id)
 		}
 	}
-
-	// Write meta to disk.
-	if err = tx.writeMeta(); err != nil {
-		lg.Errorf("writeMeta failed: %v", err)
-		tx.rollback()
-		return err
+	// 3c. publish independent touched buckets.
+	for _, p := range pendings {
+		if p.handle.cohort == nil {
+			p.handle.state.Store(p.state)
+		}
 	}
-	tx.stats.IncWriteTime(time.Since(startTime))
+	// 3d. publish dirty cohorts: rebuild each from its current members.
+	for c := range tx.dirtyCohorts {
+		members := make(map[string]*bucketState)
+		for name, h := range tx.db.buckets {
+			if h.cohort != c {
+				continue
+			}
+			if st := newStates[name]; st != nil {
+				members[name] = st
+			} else {
+				members[name] = publishedStateOf(h) // carry untouched member forward
+			}
+		}
+		c.state.Store(&cohortSnapshot{members: members})
+	}
+	tx.db.bucketsMu.Unlock()
 
 	// Finalize the transaction.
 	tx.close()
@@ -282,60 +467,44 @@ func (tx *Tx) Commit() (err error) {
 	return nil
 }
 
-func (tx *Tx) commitFreelist() error {
-	// Allocate new pages for the new free list. This will overestimate
-	// the size of the freelist but not underestimate the size (which would be bad).
-	p, err := tx.allocate((tx.db.freelist.EstimatedWritePageSize() / tx.db.pageSize) + 1)
-	if err != nil {
-		tx.rollback()
-		return err
-	}
-
-	tx.db.freelist.Write(p)
-	tx.meta.SetFreelist(p.Id())
-
-	return nil
-}
-
-// Rollback closes the transaction and ignores all previous updates. Read-only
-// transactions must be rolled back and not committed.
+// Rollback closes the transaction and ignores all previous updates.
 func (tx *Tx) Rollback() error {
 	common.Assert(!tx.managed, "managed tx rollback not allowed")
 	if tx.db == nil {
 		return berrors.ErrTxClosed
 	}
-	tx.nonPhysicalRollback()
+	tx.rollback()
 	return nil
 }
 
-// nonPhysicalRollback is called when user calls Rollback directly, in this case we do not need to reload the free pages from disk.
-func (tx *Tx) nonPhysicalRollback() {
-	if tx.db == nil {
-		return
-	}
-	if tx.writable {
-		tx.db.freelist.Rollback(tx.meta.Txid())
-	}
-	tx.close()
-}
-
-// rollback needs to reload the free pages from disk in case some system error happens like fsync error.
+// rollback rolls back the transaction (internal, panic/commit-failure/user
+// Rollback path). It restores writer-private allocator state so ids allocated
+// during this tx are discarded, reclaims BucketIds for created-then-rolled-back
+// buckets, and then closes.
 func (tx *Tx) rollback() {
 	if tx.db == nil {
 		return
 	}
+	// Only a writable tx mutates (and therefore needs to restore) the
+	// writer-private allocator state. Read txs never snapshot it, so restoring
+	// on their (mandatory) rollback would clobber the live counters with zeros.
 	if tx.writable {
-		tx.db.freelist.Rollback(tx.meta.Txid())
-		// When mmap fails, the `data`, `dataref` and `datasz` may be reset to
-		// zero values, and there is no way to reload free page IDs in this case.
-		if tx.db.data != nil {
-			if !tx.db.hasSyncedFreelist() {
-				// Reconstruct free page list by scanning the DB to get the whole free page list.
-				// Note: scanning the whole db is heavy if your db size is large in NoSyncFreeList mode.
-				tx.db.freelist.NoSyncReload(tx.db.freepages())
-			} else {
-				// Read free page list from freelist page.
-				tx.db.freelist.Reload(tx.db.page(tx.db.meta().Freelist()))
+		for _, b := range tx.bctx {
+			if b.handle == nil {
+				continue
+			}
+			b.handle.nextNodeId = b.snapNextNode
+			b.handle.freeNodeIds = b.snapFreeIds
+		}
+		// Reclaim BucketIds for buckets created then rolled back (never published).
+		for _, h := range tx.created {
+			tx.db.freeBucketId(h.id)
+		}
+		// Undo cohort adoptions: an adopted bucket's cohort was set but never
+		// published (no commit), so detach it to avoid a set-but-orphaned cohort.
+		for name := range tx.adoptedStates {
+			if h := tx.db.buckets[name]; h != nil {
+				h.cohort = nil
 			}
 		}
 	}
@@ -347,394 +516,85 @@ func (tx *Tx) close() {
 		return
 	}
 	if tx.writable {
-		// Grab freelist stats.
-		var freelistFreeN = tx.db.freelist.FreeCount()
-		var freelistPendingN = tx.db.freelist.PendingCount()
-		var freelistAlloc = tx.db.freelist.EstimatedWritePageSize()
-
-		// Remove transaction ref & writer lock.
 		tx.db.rwtx = nil
-		tx.db.rwlock.Unlock()
+
+		// Return transaction-local workNode shells to the pool. On commit their
+		// inodes were already transferred to snapNodes by freeze(), so only the
+		// shells are recycled.
+		for _, b := range tx.bctx {
+			for _, n := range b.dirty {
+				releaseWorkNode(n)
+			}
+		}
 
 		// Merge statistics.
-		tx.db.statlock.Lock()
-		tx.db.stats.FreePageN = freelistFreeN
-		tx.db.stats.PendingPageN = freelistPendingN
-		tx.db.stats.FreeAlloc = (freelistFreeN + freelistPendingN) * tx.db.pageSize
-		tx.db.stats.FreelistInuse = freelistAlloc
-		tx.db.stats.TxStats.add(&tx.stats)
-		tx.db.statlock.Unlock()
+		if tx.db.stats != nil {
+			tx.db.statlock.Lock()
+			tx.db.stats.FreePageN = 0
+			tx.db.stats.PendingPageN = 0
+			tx.db.stats.FreeAlloc = 0
+			tx.db.stats.FreelistInuse = 0
+			tx.db.stats.TxStats.add(&tx.stats)
+			tx.db.statlock.Unlock()
+		}
+
+		tx.db.rwlock.Unlock()
 	} else {
 		tx.db.removeTx(tx)
 	}
 
 	// Clear all references.
 	tx.db = nil
-	tx.meta = nil
-	tx.root = Bucket{tx: tx}
-	tx.pages = nil
+	tx.bctx = nil
+	tx.created = nil
+	tx.deleted = nil
+	tx.cohortSnaps = nil
+	tx.dirtyCohorts = nil
+	tx.adoptedStates = nil
 }
 
-// Copy writes the entire database to a writer.
-// This function exists for backwards compatibility.
-//
-// Deprecated: Use WriteTo() instead.
-func (tx *Tx) Copy(w io.Writer) error {
+// Copy writes the entire database to a writer as a BMSP snapshot (see snapshot.go).
+func (tx *Tx) Copy(w errorWriter) error {
 	_, err := tx.WriteTo(w)
 	return err
 }
 
-// WriteTo writes the entire database to a writer.
-// If err == nil then exactly tx.Size() bytes will be written into the writer.
-func (tx *Tx) WriteTo(w io.Writer) (n int64, err error) {
-	var f *os.File
-	// There is a risk that between the time a read-only transaction
-	// is created and the time the file is actually opened, the
-	// underlying db file at tx.db.path may have been replaced
-	// (e.g. via rename). In that case, opening the file again would
-	// unexpectedly point to a different file, rather than the one
-	// the transaction was based on.
-	//
-	// To overcome this, we reuse the already opened file handle when
-	// WritFlag not set. When the WriteFlag is set, we reopen the file
-	// but verify that it still refers to the same underlying file
-	// (by device and inode). If it does not, we fall back to
-	// reusing the existing already opened file handle.
-	if tx.WriteFlag != 0 {
-		// Attempt to open reader with WriteFlag
-		f, err = tx.db.openFile(tx.db.path, os.O_RDONLY|tx.WriteFlag, 0)
-		if err != nil {
-			return 0, err
-		}
-
-		if ok, err := sameFile(tx.db.file, f); !ok {
-			lg := tx.db.Logger()
-			if cerr := f.Close(); cerr != nil {
-				lg.Errorf("failed to close the file (%s): %v", tx.db.path, cerr)
-			}
-			lg.Warningf("The underlying file has changed, so reuse the already opened file (%s): %v", tx.db.path, err)
-			f = tx.db.file
-		} else {
-			defer func() {
-				if cerr := f.Close(); err == nil {
-					err = cerr
-				}
-			}()
-		}
-	} else {
-		f = tx.db.file
-	}
-
-	// Generate a meta page. We use the same page data for both meta pages.
-	buf := make([]byte, tx.db.pageSize)
-	page := (*common.Page)(unsafe.Pointer(&buf[0]))
-	page.SetFlags(common.MetaPageFlag)
-	*page.Meta() = *tx.meta
-
-	// Write meta 0.
-	page.SetId(0)
-	page.Meta().SetChecksum(page.Meta().Sum64())
-	nn, err := w.Write(buf)
-	n += int64(nn)
-	if err != nil {
-		return n, fmt.Errorf("meta 0 copy: %s", err)
-	}
-
-	// Write meta 1 with a lower transaction id.
-	page.SetId(1)
-	page.Meta().DecTxid()
-	page.Meta().SetChecksum(page.Meta().Sum64())
-	nn, err = w.Write(buf)
-	n += int64(nn)
-	if err != nil {
-		return n, fmt.Errorf("meta 1 copy: %s", err)
-	}
-
-	// Copy data pages using a SectionReader to avoid affecting f's offset.
-	dataOffset := int64(tx.db.pageSize * 2)
-	dataSize := tx.Size() - dataOffset
-	sr := io.NewSectionReader(f, dataOffset, dataSize)
-
-	// Copy data pages.
-	wn, err := io.CopyN(w, sr, dataSize)
-	n += wn
-	if err != nil {
-		return n, err
-	}
-
-	return n, nil
+// WriteTo writes the entire database to a writer as a BMSP snapshot. It traverses
+// top-level buckets in sorted name order (via Tx.Cursor) and, within each, keys
+// in sorted order, so the output is deterministic and round-trips with Restore.
+func (tx *Tx) WriteTo(w errorWriter) (n int64, err error) {
+	return tx.serializeSnapshot(w)
 }
 
-func sameFile(f1, f2 *os.File) (bool, error) {
-	fi1, err := f1.Stat()
-	if err != nil {
-		return false, fmt.Errorf("failed to get fileInfo of the first file (%s): %w", f1.Name(), err)
-	}
-	fi2, err := f2.Stat()
-	if err != nil {
-		return false, fmt.Errorf("failed to get fileInfo of the second file (%s): %w", f2.Name(), err)
-	}
-
-	return os.SameFile(fi1, fi2), nil
-}
-
-// CopyFile copies the entire database to file at the given path.
-// A reader transaction is maintained during the copy so it is safe to continue
-// using the database while a copy is in progress.
+// CopyFile writes the entire database to a file at path as a BMSP snapshot.
 func (tx *Tx) CopyFile(path string, mode os.FileMode) error {
-	f, err := tx.db.openFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, mode)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
 		return err
 	}
-
+	defer f.Close()
 	_, err = tx.WriteTo(f)
-	if err != nil {
-		_ = f.Close()
-		return err
-	}
-	return f.Close()
+	return err
 }
 
-// allocate returns a contiguous block of memory starting at a given page.
-func (tx *Tx) allocate(count int) (*common.Page, error) {
-	lg := tx.db.Logger()
-	p, err := tx.db.allocate(tx.meta.Txid(), count)
-	if err != nil {
-		lg.Errorf("allocating failed, txid: %d, count: %d, error: %v", tx.meta.Txid(), count, err)
-		return nil, err
-	}
-
-	// Save to our page cache.
-	tx.pages[p.Id()] = p
-
-	// Update statistics.
-	tx.stats.IncPageCount(int64(count))
-	tx.stats.IncPageAlloc(int64(count * tx.db.pageSize))
-
-	return p, nil
-}
-
-// write writes any dirty pages to disk.
-func (tx *Tx) write() error {
-	// Sort pages by id.
-	lg := tx.db.Logger()
-	pages := make(common.Pages, 0, len(tx.pages))
-	for _, p := range tx.pages {
-		pages = append(pages, p)
-	}
-	// Clear out page cache early.
-	tx.pages = make(map[common.Pgid]*common.Page)
-	sort.Sort(pages)
-
-	// Write pages to disk in order.
-	for _, p := range pages {
-		rem := (uint64(p.Overflow()) + 1) * uint64(tx.db.pageSize)
-		offset := int64(p.Id()) * int64(tx.db.pageSize)
-		var written uintptr
-
-		// Write out page in "max allocation" sized chunks.
-		for {
-			sz := rem
-			if sz > common.MaxAllocSize-1 {
-				sz = common.MaxAllocSize - 1
-			}
-			buf := common.UnsafeByteSlice(unsafe.Pointer(p), written, 0, int(sz))
-
-			if _, err := tx.db.ops.writeAt(buf, offset); err != nil {
-				lg.Errorf("writeAt failed, offset: %d: %w", offset, err)
-				return err
-			}
-
-			// Update statistics.
-			tx.stats.IncWrite(1)
-
-			// Exit inner for loop if we've written all the chunks.
-			rem -= sz
-			if rem == 0 {
-				break
-			}
-
-			// Otherwise move offset forward and move pointer to next chunk.
-			offset += int64(sz)
-			written += uintptr(sz)
-		}
-	}
-
-	// Ignore file sync if flag is set on DB.
-	if !tx.db.NoSync || common.IgnoreNoSync {
-		// gofail: var beforeSyncDataPages struct{}
-		if err := fdatasync(tx.db); err != nil {
-			lg.Errorf("[GOOS: %s, GOARCH: %s] fdatasync failed: %w", runtime.GOOS, runtime.GOARCH, err)
-			return err
-		}
-	}
-
-	// Put small pages back to page pool.
-	for _, p := range pages {
-		// Ignore page sizes over 1 page.
-		// These are allocated using make() instead of the page pool.
-		if int(p.Overflow()) != 0 {
-			continue
-		}
-
-		buf := common.UnsafeByteSlice(unsafe.Pointer(p), 0, 0, tx.db.pageSize)
-
-		// See https://go.googlesource.com/go/+/f03c9202c43e0abb130669852082117ca50aa9b1
-		for i := range buf {
-			buf[i] = 0
-		}
-		tx.db.pagePool.Put(buf) //nolint:staticcheck
-	}
-
-	return nil
-}
-
-// writeMeta writes the meta to the disk.
-func (tx *Tx) writeMeta() error {
-	// gofail: var beforeWriteMetaError string
-	// return errors.New(beforeWriteMetaError)
-
-	// Create a temporary buffer for the meta page.
-	lg := tx.db.Logger()
-	buf := make([]byte, tx.db.pageSize)
-	p := tx.db.pageInBuffer(buf, 0)
-	tx.meta.Write(p)
-
-	// Write the meta page to file.
-	tx.db.metalock.Lock()
-	if _, err := tx.db.ops.writeAt(buf, int64(p.Id())*int64(tx.db.pageSize)); err != nil {
-		tx.db.metalock.Unlock()
-		lg.Errorf("writeAt failed, pgid: %d, pageSize: %d, error: %v", p.Id(), tx.db.pageSize, err)
-		return err
-	}
-	tx.db.metalock.Unlock()
-	if !tx.db.NoSync || common.IgnoreNoSync {
-		// gofail: var beforeSyncMetaPage struct{}
-		if err := fdatasync(tx.db); err != nil {
-			lg.Errorf("[GOOS: %s, GOARCH: %s] fdatasync failed: %w", runtime.GOOS, runtime.GOARCH, err)
-			return err
-		}
-	}
-
-	// Update statistics.
-	tx.stats.IncWrite(1)
-
-	return nil
-}
-
-// page returns a reference to the page with a given id.
-// If page has been written to then a temporary buffered page is returned.
-func (tx *Tx) page(id common.Pgid) *common.Page {
-	// Check the dirty pages first.
-	if tx.pages != nil {
-		if p, ok := tx.pages[id]; ok {
-			p.FastCheck(id)
-			return p
-		}
-	}
-
-	// Otherwise return directly from the mmap.
-	p := tx.db.page(id)
-	p.FastCheck(id)
-	return p
-}
-
-// forEachPage iterates over every page within a given page and executes a function.
-func (tx *Tx) forEachPage(pgidnum common.Pgid, fn func(*common.Page, int, []common.Pgid)) {
-	stack := make([]common.Pgid, 10)
-	stack[0] = pgidnum
-	tx.forEachPageInternal(stack[:1], fn)
-}
-
-func (tx *Tx) forEachPageInternal(pgidstack []common.Pgid, fn func(*common.Page, int, []common.Pgid)) {
-	p := tx.page(pgidstack[len(pgidstack)-1])
-
-	// Execute function.
-	fn(p, len(pgidstack)-1, pgidstack)
-
-	// Recursively loop over children.
-	if p.IsBranchPage() {
-		for i := 0; i < int(p.Count()); i++ {
-			elem := p.BranchPageElement(uint16(i))
-			tx.forEachPageInternal(append(pgidstack, elem.Pgid()), fn)
-		}
-	}
-}
-
-// Page returns page information for a given page number.
-// This is only safe for concurrent use when used by a writable transaction.
-func (tx *Tx) Page(id int) (*common.PageInfo, error) {
-	if tx.db == nil {
-		return nil, berrors.ErrTxClosed
-	} else if common.Pgid(id) >= tx.meta.Pgid() {
-		return nil, nil
-	}
-
-	if tx.db.freelist == nil {
-		return nil, berrors.ErrFreePagesNotLoaded
-	}
-
-	// Build the page info.
-	p := tx.db.page(common.Pgid(id))
-	info := &common.PageInfo{
-		ID:            id,
-		Count:         int(p.Count()),
-		OverflowCount: int(p.Overflow()),
-	}
-
-	// Determine the type (or if it's free).
-	if tx.db.freelist.Freed(common.Pgid(id)) {
-		info.Type = "free"
-	} else {
-		info.Type = p.Typ()
-	}
-
-	return info, nil
+type errorWriter interface {
+	Write(p []byte) (n int, err error)
 }
 
 // TxStats represents statistics about the actions performed by the transaction.
 type TxStats struct {
-	// Page statistics.
-	//
-	// DEPRECATED: Use GetPageCount() or IncPageCount()
-	PageCount int64 // number of page allocations
-	// DEPRECATED: Use GetPageAlloc() or IncPageAlloc()
-	PageAlloc int64 // total bytes allocated
-
-	// Cursor statistics.
-	//
-	// DEPRECATED: Use GetCursorCount() or IncCursorCount()
-	CursorCount int64 // number of cursors created
-
-	// Node statistics
-	//
-	// DEPRECATED: Use GetNodeCount() or IncNodeCount()
-	NodeCount int64 // number of node allocations
-	// DEPRECATED: Use GetNodeDeref() or IncNodeDeref()
-	NodeDeref int64 // number of node dereferences
-
-	// Rebalance statistics.
-	//
-	// DEPRECATED: Use GetRebalance() or IncRebalance()
-	Rebalance int64 // number of node rebalances
-	// DEPRECATED: Use GetRebalanceTime() or IncRebalanceTime()
-	RebalanceTime time.Duration // total time spent rebalancing
-
-	// Split/Spill statistics.
-	//
-	// DEPRECATED: Use GetSplit() or IncSplit()
-	Split int64 // number of nodes split
-	// DEPRECATED: Use GetSpill() or IncSpill()
-	Spill int64 // number of nodes spilled
-	// DEPRECATED: Use GetSpillTime() or IncSpillTime()
-	SpillTime time.Duration // total time spent spilling
-
-	// Write statistics.
-	//
-	// DEPRECATED: Use GetWrite() or IncWrite()
-	Write int64 // number of writes performed
-	// DEPRECATED: Use GetWriteTime() or IncWriteTime()
-	WriteTime time.Duration // total time spent writing to disk
+	PageCount     int64
+	PageAlloc     int64
+	CursorCount   int64
+	NodeCount     int64
+	NodeDeref     int64
+	Rebalance     int64
+	RebalanceTime time.Duration
+	Split         int64
+	Spill         int64
+	SpillTime     time.Duration
+	Write         int64
+	WriteTime     time.Duration
 }
 
 func (s *TxStats) add(other *TxStats) {
@@ -753,8 +613,6 @@ func (s *TxStats) add(other *TxStats) {
 }
 
 // Sub calculates and returns the difference between two sets of transaction stats.
-// This is useful when obtaining stats at two different points and time and
-// you need the performance counters that occurred within that time span.
 func (s *TxStats) Sub(other *TxStats) TxStats {
 	var diff TxStats
 	diff.PageCount = s.GetPageCount() - other.GetPageCount()
@@ -772,122 +630,98 @@ func (s *TxStats) Sub(other *TxStats) TxStats {
 	return diff
 }
 
-// GetPageCount returns PageCount atomically.
 func (s *TxStats) GetPageCount() int64 {
 	return atomic.LoadInt64(&s.PageCount)
 }
 
-// IncPageCount increases PageCount atomically and returns the new value.
 func (s *TxStats) IncPageCount(delta int64) int64 {
 	return atomic.AddInt64(&s.PageCount, delta)
 }
 
-// GetPageAlloc returns PageAlloc atomically.
 func (s *TxStats) GetPageAlloc() int64 {
 	return atomic.LoadInt64(&s.PageAlloc)
 }
 
-// IncPageAlloc increases PageAlloc atomically and returns the new value.
 func (s *TxStats) IncPageAlloc(delta int64) int64 {
 	return atomic.AddInt64(&s.PageAlloc, delta)
 }
 
-// GetCursorCount returns CursorCount atomically.
 func (s *TxStats) GetCursorCount() int64 {
 	return atomic.LoadInt64(&s.CursorCount)
 }
 
-// IncCursorCount increases CursorCount atomically and return the new value.
 func (s *TxStats) IncCursorCount(delta int64) int64 {
 	return atomic.AddInt64(&s.CursorCount, delta)
 }
 
-// GetNodeCount returns NodeCount atomically.
 func (s *TxStats) GetNodeCount() int64 {
 	return atomic.LoadInt64(&s.NodeCount)
 }
 
-// IncNodeCount increases NodeCount atomically and returns the new value.
 func (s *TxStats) IncNodeCount(delta int64) int64 {
 	return atomic.AddInt64(&s.NodeCount, delta)
 }
 
-// GetNodeDeref returns NodeDeref atomically.
 func (s *TxStats) GetNodeDeref() int64 {
 	return atomic.LoadInt64(&s.NodeDeref)
 }
 
-// IncNodeDeref increases NodeDeref atomically and returns the new value.
 func (s *TxStats) IncNodeDeref(delta int64) int64 {
 	return atomic.AddInt64(&s.NodeDeref, delta)
 }
 
-// GetRebalance returns Rebalance atomically.
 func (s *TxStats) GetRebalance() int64 {
 	return atomic.LoadInt64(&s.Rebalance)
 }
 
-// IncRebalance increases Rebalance atomically and returns the new value.
 func (s *TxStats) IncRebalance(delta int64) int64 {
 	return atomic.AddInt64(&s.Rebalance, delta)
 }
 
-// GetRebalanceTime returns RebalanceTime atomically.
 func (s *TxStats) GetRebalanceTime() time.Duration {
 	return atomicLoadDuration(&s.RebalanceTime)
 }
 
-// IncRebalanceTime increases RebalanceTime atomically and returns the new value.
 func (s *TxStats) IncRebalanceTime(delta time.Duration) time.Duration {
 	return atomicAddDuration(&s.RebalanceTime, delta)
 }
 
-// GetSplit returns Split atomically.
 func (s *TxStats) GetSplit() int64 {
 	return atomic.LoadInt64(&s.Split)
 }
 
-// IncSplit increases Split atomically and returns the new value.
 func (s *TxStats) IncSplit(delta int64) int64 {
 	return atomic.AddInt64(&s.Split, delta)
 }
 
-// GetSpill returns Spill atomically.
 func (s *TxStats) GetSpill() int64 {
 	return atomic.LoadInt64(&s.Spill)
 }
 
-// IncSpill increases Spill atomically and returns the new value.
 func (s *TxStats) IncSpill(delta int64) int64 {
 	return atomic.AddInt64(&s.Spill, delta)
 }
 
-// GetSpillTime returns SpillTime atomically.
 func (s *TxStats) GetSpillTime() time.Duration {
 	return atomicLoadDuration(&s.SpillTime)
 }
 
-// IncSpillTime increases SpillTime atomically and returns the new value.
 func (s *TxStats) IncSpillTime(delta time.Duration) time.Duration {
 	return atomicAddDuration(&s.SpillTime, delta)
 }
 
-// GetWrite returns Write atomically.
 func (s *TxStats) GetWrite() int64 {
 	return atomic.LoadInt64(&s.Write)
 }
 
-// IncWrite increases Write atomically and returns the new value.
 func (s *TxStats) IncWrite(delta int64) int64 {
 	return atomic.AddInt64(&s.Write, delta)
 }
 
-// GetWriteTime returns WriteTime atomically.
 func (s *TxStats) GetWriteTime() time.Duration {
 	return atomicLoadDuration(&s.WriteTime)
 }
 
-// IncWriteTime increases WriteTime atomically and returns the new value.
 func (s *TxStats) IncWriteTime(delta time.Duration) time.Duration {
 	return atomicAddDuration(&s.WriteTime, delta)
 }

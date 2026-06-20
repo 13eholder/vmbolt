@@ -8,21 +8,16 @@ import (
 	"13eholder/vmbolt/internal/common"
 )
 
-// node represents an in-memory, deserialized page.
-type node struct {
-	bucket     *Bucket
-	isLeaf     bool
-	unbalanced bool
-	spilled    bool
-	key        []byte
-	pgid       common.Pgid
-	parent     *node
-	children   nodes
-	inodes     common.Inodes
-}
+const (
+	defaultMaxNodeSizeBytes  = 32 * 1024
+	defaultMinNodeMergeBytes = defaultMaxNodeSizeBytes / 4
+	nodeHeaderOverheadBytes  = 32
+	nodeInodeOverheadBytes   = 24
+	minKeysPerNode           = 2
+)
 
 // root returns the top-level node this node is attached to.
-func (n *node) root() *node {
+func (n *workNode) root() *workNode {
 	if n.parent == nil {
 		return n
 	}
@@ -30,31 +25,29 @@ func (n *node) root() *node {
 }
 
 // minKeys returns the minimum number of inodes this node should have.
-func (n *node) minKeys() int {
+func (n *workNode) minKeys() int {
 	if n.isLeaf {
 		return 1
 	}
 	return 2
 }
 
-// size returns the size of the node after serialization.
-func (n *node) size() int {
-	sz, elsz := common.PageHeaderSize, n.pageElementSize()
+// size returns the serialized size of the node (used for split threshold).
+func (n *workNode) size() int {
+	sz := nodeHeaderOverheadBytes
 	for i := 0; i < len(n.inodes); i++ {
 		item := &n.inodes[i]
-		sz += elsz + uintptr(len(item.Key())) + uintptr(len(item.Value()))
+		sz += nodeInodeOverheadBytes + len(item.Key()) + len(item.Value())
 	}
-	return int(sz)
+	return sz
 }
 
 // sizeLessThan returns true if the node is less than a given size.
-// This is an optimization to avoid calculating a large node when we only need
-// to know if it fits inside a certain page size.
-func (n *node) sizeLessThan(v uintptr) bool {
-	sz, elsz := common.PageHeaderSize, n.pageElementSize()
+func (n *workNode) sizeLessThan(v int) bool {
+	sz := nodeHeaderOverheadBytes
 	for i := 0; i < len(n.inodes); i++ {
 		item := &n.inodes[i]
-		sz += elsz + uintptr(len(item.Key())) + uintptr(len(item.Value()))
+		sz += nodeInodeOverheadBytes + len(item.Key()) + len(item.Value())
 		if sz >= v {
 			return false
 		}
@@ -62,35 +55,27 @@ func (n *node) sizeLessThan(v uintptr) bool {
 	return true
 }
 
-// pageElementSize returns the size of each page element based on the type of node.
-func (n *node) pageElementSize() uintptr {
-	if n.isLeaf {
-		return common.LeafPageElementSize
-	}
-	return common.BranchPageElementSize
-}
-
 // childAt returns the child node at a given index.
-func (n *node) childAt(index int) *node {
+func (n *workNode) childAt(index int) *workNode {
 	if n.isLeaf {
 		panic(fmt.Sprintf("invalid childAt(%d) on a leaf node", index))
 	}
-	return n.bucket.node(n.inodes[index].Pgid(), n)
+	return n.bucket.node(n.inodes[index].Nid(), n)
 }
 
 // childIndex returns the index of a given child node.
-func (n *node) childIndex(child *node) int {
+func (n *workNode) childIndex(child *workNode) int {
 	index := sort.Search(len(n.inodes), func(i int) bool { return bytes.Compare(n.inodes[i].Key(), child.key) != -1 })
 	return index
 }
 
 // numChildren returns the number of children.
-func (n *node) numChildren() int {
+func (n *workNode) numChildren() int {
 	return len(n.inodes)
 }
 
 // nextSibling returns the next node with the same parent.
-func (n *node) nextSibling() *node {
+func (n *workNode) nextSibling() *workNode {
 	if n.parent == nil {
 		return nil
 	}
@@ -102,7 +87,7 @@ func (n *node) nextSibling() *node {
 }
 
 // prevSibling returns the previous node with the same parent.
-func (n *node) prevSibling() *node {
+func (n *workNode) prevSibling() *workNode {
 	if n.parent == nil {
 		return nil
 	}
@@ -114,10 +99,8 @@ func (n *node) prevSibling() *node {
 }
 
 // put inserts a key/value.
-func (n *node) put(oldKey, newKey, value []byte, pgId common.Pgid, flags uint32) {
-	if pgId >= n.bucket.tx.meta.Pgid() {
-		panic(fmt.Sprintf("pgId (%d) above high water mark (%d)", pgId, n.bucket.tx.meta.Pgid()))
-	} else if len(oldKey) <= 0 {
+func (n *workNode) put(oldKey, newKey, value []byte, nId common.Nid, flags uint32) {
+	if len(oldKey) <= 0 {
 		panic("put: zero-length old key")
 	} else if len(newKey) <= 0 {
 		panic("put: zero-length new key")
@@ -137,12 +120,12 @@ func (n *node) put(oldKey, newKey, value []byte, pgId common.Pgid, flags uint32)
 	inode.SetFlags(flags)
 	inode.SetKey(newKey)
 	inode.SetValue(value)
-	inode.SetPgid(pgId)
+	inode.SetPgid(nId)
 	common.Assert(len(inode.Key()) > 0, "put: zero-length inode key")
 }
 
 // del removes a key from the node.
-func (n *node) del(key []byte) {
+func (n *workNode) del(key []byte) {
 	// Find index of key.
 	index := sort.Search(len(n.inodes), func(i int) bool { return bytes.Compare(n.inodes[i].Key(), key) != -1 })
 
@@ -158,58 +141,15 @@ func (n *node) del(key []byte) {
 	n.unbalanced = true
 }
 
-// read initializes the node from a page.
-func (n *node) read(p *common.Page) {
-	n.pgid = p.Id()
-	n.isLeaf = p.IsLeafPage()
-	n.inodes = common.ReadInodeFromPage(p)
-
-	// Save first key, so we can find the node in the parent when we spill.
-	if len(n.inodes) > 0 {
-		n.key = n.inodes[0].Key()
-		common.Assert(len(n.key) > 0, "read: zero-length node key")
-	} else {
-		n.key = nil
-	}
-}
-
-// write writes the items onto one or more pages.
-// The page should have p.id (might be 0 for meta or bucket-inline page) and p.overflow set
-// and the rest should be zeroed.
-func (n *node) write(p *common.Page) {
-	common.Assert(p.Count() == 0 && p.Flags() == 0, "node cannot be written into a not empty page")
-
-	// Initialize page.
-	if n.isLeaf {
-		p.SetFlags(common.LeafPageFlag)
-	} else {
-		p.SetFlags(common.BranchPageFlag)
-	}
-
-	if len(n.inodes) >= 0xFFFF {
-		panic(fmt.Sprintf("inode overflow: %d (pgid=%d)", len(n.inodes), p.Id()))
-	}
-	p.SetCount(uint16(len(n.inodes)))
-
-	// Stop here if there are no items to write.
-	if p.Count() == 0 {
-		return
-	}
-
-	common.WriteInodeToPage(n.inodes, p)
-
-	// DEBUG ONLY: n.dump()
-}
-
 // split breaks up a node into multiple smaller nodes, if appropriate.
 // This should only be called from the spill() function.
-func (n *node) split(pageSize uintptr) []*node {
-	var nodes []*node
+func (n *workNode) split() []*workNode {
+	var nodes []*workNode
 
 	node := n
 	for {
 		// Split node into two.
-		a, b := node.splitTwo(pageSize)
+		a, b := node.splitTwo()
 		nodes = append(nodes, a)
 
 		// If we can't split then exit the loop.
@@ -226,10 +166,10 @@ func (n *node) split(pageSize uintptr) []*node {
 
 // splitTwo breaks up a node into two smaller nodes, if appropriate.
 // This should only be called from the split() function.
-func (n *node) splitTwo(pageSize uintptr) (*node, *node) {
-	// Ignore the split if the page doesn't have at least enough nodes for
-	// two pages or if the nodes can fit in a single page.
-	if len(n.inodes) <= (common.MinKeysPerPage*2) || n.sizeLessThan(pageSize) {
+func (n *workNode) splitTwo() (*workNode, *workNode) {
+	// Ignore the split if the node doesn't have at least enough nodes for
+	// two nodes or if the nodes can fit in a single node.
+	if len(n.inodes) <= (minKeysPerNode*2) || n.sizeLessThan(defaultMaxNodeSizeBytes) {
 		return n, nil
 	}
 
@@ -240,19 +180,19 @@ func (n *node) splitTwo(pageSize uintptr) (*node, *node) {
 	} else if fillPercent > maxFillPercent {
 		fillPercent = maxFillPercent
 	}
-	threshold := int(float64(pageSize) * fillPercent)
+	threshold := int(float64(defaultMaxNodeSizeBytes) * fillPercent)
 
-	// Determine split position and sizes of the two pages.
+	// Determine split position and sizes of the two nodes.
 	splitIndex, _ := n.splitIndex(threshold)
 
 	// Split node into two separate nodes.
 	// If there's no parent then we'll need to create one.
 	if n.parent == nil {
-		n.parent = &node{bucket: n.bucket, children: []*node{n}}
+		n.parent = &workNode{bucket: n.bucket, children: []*workNode{n}}
 	}
 
 	// Create a new node and add it to the parent.
-	next := &node{bucket: n.bucket, isLeaf: n.isLeaf, parent: n.parent}
+	next := &workNode{bucket: n.bucket, isLeaf: n.isLeaf, parent: n.parent}
 	n.parent.children = append(n.parent.children, next)
 
 	// Split inodes across two nodes.
@@ -265,21 +205,21 @@ func (n *node) splitTwo(pageSize uintptr) (*node, *node) {
 	return n, next
 }
 
-// splitIndex finds the position where a page will fill a given threshold.
-// It returns the index as well as the size of the first page.
+// splitIndex finds the position where a node will fill a given threshold.
+// It returns the index as well as the size of the first node.
 // This is only be called from split().
-func (n *node) splitIndex(threshold int) (index, sz uintptr) {
-	sz = common.PageHeaderSize
+func (n *workNode) splitIndex(threshold int) (index, sz int) {
+	sz = nodeHeaderOverheadBytes
 
-	// Loop until we only have the minimum number of keys required for the second page.
-	for i := 0; i < len(n.inodes)-common.MinKeysPerPage; i++ {
-		index = uintptr(i)
+	// Loop until we only have the minimum number of keys required for the second node.
+	for i := 0; i < len(n.inodes)-minKeysPerNode; i++ {
+		index = i
 		inode := n.inodes[i]
-		elsize := n.pageElementSize() + uintptr(len(inode.Key())) + uintptr(len(inode.Value()))
+		elsize := nodeInodeOverheadBytes + len(inode.Key()) + len(inode.Value())
 
 		// If we have at least the minimum number of keys and adding another
 		// node would put us over the threshold then exit and return.
-		if index >= common.MinKeysPerPage && sz+elsize > uintptr(threshold) {
+		if index >= minKeysPerNode && sz+elsize > threshold {
 			break
 		}
 
@@ -290,9 +230,8 @@ func (n *node) splitIndex(threshold int) (index, sz uintptr) {
 	return
 }
 
-// spill writes the nodes to dirty pages and splits nodes as it goes.
-// Returns an error if dirty pages cannot be allocated.
-func (n *node) spill() error {
+// finalize assigns logical ids to materialized nodes and updates parent links.
+func (n *workNode) finalize() error {
 	var tx = n.bucket.tx
 	if n.spilled {
 		return nil
@@ -303,7 +242,7 @@ func (n *node) spill() error {
 	// the children size on every loop iteration.
 	sort.Sort(n.children)
 	for i := 0; i < len(n.children); i++ {
-		if err := n.children[i].spill(); err != nil {
+		if err := n.children[i].finalize(); err != nil {
 			return err
 		}
 	}
@@ -312,49 +251,48 @@ func (n *node) spill() error {
 	n.children = nil
 
 	// Split nodes into appropriate sizes. The first node will always be n.
-	var nodes = n.split(uintptr(tx.db.pageSize))
+	var nodes = n.split()
 	for _, node := range nodes {
-		// Add node's page to the freelist if it's not new.
-		if node.pgid > 0 {
-			tx.db.freelist.Free(tx.meta.Txid(), tx.page(node.pgid))
-			node.pgid = 0
+		if node.nid == 0 {
+			nid, err := n.bucket.allocate()
+			if err != nil {
+				return err
+			}
+			// The node was tracked under the placeholder key 0 (unfinalized
+			// root); move it to its real id so it is frozen exactly once.
+			delete(n.bucket.dirty, 0)
+			node.nid = nid
 		}
-
-		// Allocate contiguous space for the node.
-		p, err := tx.allocate((node.size() + tx.db.pageSize - 1) / tx.db.pageSize)
-		if err != nil {
-			return err
-		}
-
-		// Write the node.
-		if p.Id() >= tx.meta.Pgid() {
-			panic(fmt.Sprintf("pgid (%d) above high water mark (%d)", p.Id(), tx.meta.Pgid()))
-		}
-		node.pgid = p.Id()
-		node.write(p)
 		node.spilled = true
 
-		// Insert into parent inodes.
+		n.bucket.dirty[node.nid] = node
+
+		// Update the parent entry to point at the finalized child.
 		if node.parent != nil {
 			var key = node.key
-			if key == nil {
+			if len(key) == 0 {
+				if len(node.inodes) == 0 {
+					panic(fmt.Sprintf("finalize: node %d has no inodes", node.nid))
+				}
 				key = node.inodes[0].Key()
 			}
+			if len(key) == 0 {
+				panic(fmt.Sprintf("finalize: zero-length key for node %d, inodes=%d, isLeaf=%v", node.nid, len(node.inodes), node.isLeaf))
+			}
 
-			node.parent.put(key, node.inodes[0].Key(), nil, node.pgid, 0)
+			node.parent.put(key, node.inodes[0].Key(), nil, node.nid, 0)
 			node.key = node.inodes[0].Key()
-			common.Assert(len(node.key) > 0, "spill: zero-length node key")
+			common.Assert(len(node.key) > 0, "finalize: zero-length node key")
 		}
 
 		// Update the statistics.
 		tx.stats.IncSpill(1)
 	}
 
-	// If the root node split and created a new root then we need to spill that
-	// as well. We'll clear out the children to make sure it doesn't try to respill.
-	if n.parent != nil && n.parent.pgid == 0 {
+	// If the root node split and created a new root then finalize that as well.
+	if n.parent != nil && n.parent.nid == 0 {
 		n.children = nil
-		return n.parent.spill()
+		return n.parent.finalize()
 	}
 
 	return nil
@@ -362,7 +300,7 @@ func (n *node) spill() error {
 
 // rebalance attempts to combine the node with sibling nodes if the node fill
 // size is below a threshold or if there are not enough keys.
-func (n *node) rebalance() {
+func (n *workNode) rebalance() {
 	if !n.unbalanced {
 		return
 	}
@@ -372,7 +310,7 @@ func (n *node) rebalance() {
 	n.bucket.tx.stats.IncRebalance(1)
 
 	// Ignore if node is above threshold (25% when FillPercent is set to DefaultFillPercent) and has enough keys.
-	var threshold = int(float64(n.bucket.tx.db.pageSize)*n.bucket.FillPercent) / 2
+	var threshold = defaultMinNodeMergeBytes
 	if n.size() > threshold && len(n.inodes) > n.minKeys() {
 		return
 	}
@@ -382,22 +320,21 @@ func (n *node) rebalance() {
 		// If root node is a branch and only has one node then collapse it.
 		if !n.isLeaf && len(n.inodes) == 1 {
 			// Move root's child up.
-			child := n.bucket.node(n.inodes[0].Pgid(), n)
+			child := n.bucket.node(n.inodes[0].Nid(), n)
 			n.isLeaf = child.isLeaf
 			n.inodes = child.inodes[:]
 			n.children = child.children
 
 			// Reparent all child nodes being moved.
 			for _, inode := range n.inodes {
-				if child, ok := n.bucket.nodes[inode.Pgid()]; ok {
+				if child, ok := n.bucket.dirty[inode.Nid()]; ok {
 					child.parent = n
 				}
 			}
 
 			// Remove old child.
 			child.parent = nil
-			delete(n.bucket.nodes, child.pgid)
-			child.free()
+			n.bucket.dropNode(child.nid)
 		}
 
 		return
@@ -405,10 +342,11 @@ func (n *node) rebalance() {
 
 	// If node has no keys then just remove it.
 	if n.numChildren() == 0 {
+		oldID := n.nid
 		n.parent.del(n.key)
 		n.parent.removeChild(n)
-		delete(n.bucket.nodes, n.pgid)
-		n.free()
+		n.bucket.dropNode(oldID)
+		n.nid = 0
 		n.parent.rebalance()
 		return
 	}
@@ -416,7 +354,7 @@ func (n *node) rebalance() {
 	common.Assert(n.parent.numChildren() > 1, "parent must have at least 2 children")
 
 	// Merge with right sibling if idx == 0, otherwise left sibling.
-	var leftNode, rightNode *node
+	var leftNode, rightNode *workNode
 	var useNextSibling = n.parent.childIndex(n) == 0
 	if useNextSibling {
 		leftNode = n
@@ -428,8 +366,9 @@ func (n *node) rebalance() {
 
 	// If both nodes are too small then merge them.
 	// Reparent all child nodes being moved.
+	oldRightID := rightNode.nid
 	for _, inode := range rightNode.inodes {
-		if child, ok := n.bucket.nodes[inode.Pgid()]; ok {
+		if child, ok := n.bucket.dirty[inode.Nid()]; ok {
 			child.parent.removeChild(child)
 			child.parent = leftNode
 			child.parent.children = append(child.parent.children, child)
@@ -440,8 +379,7 @@ func (n *node) rebalance() {
 	leftNode.inodes = append(leftNode.inodes, rightNode.inodes...)
 	n.parent.del(rightNode.key)
 	n.parent.removeChild(rightNode)
-	delete(n.bucket.nodes, rightNode.pgid)
-	rightNode.free()
+	n.bucket.dropNode(oldRightID)
 
 	// Either this node or the sibling node was deleted from the parent so rebalance it.
 	n.parent.rebalance()
@@ -449,52 +387,12 @@ func (n *node) rebalance() {
 
 // removes a node from the list of in-memory children.
 // This does not affect the inodes.
-func (n *node) removeChild(target *node) {
+func (n *workNode) removeChild(target *workNode) {
 	for i, child := range n.children {
 		if child == target {
 			n.children = append(n.children[:i], n.children[i+1:]...)
 			return
 		}
-	}
-}
-
-// dereference causes the node to copy all its inode key/value references to heap memory.
-// This is required when the mmap is reallocated so inodes are not pointing to stale data.
-func (n *node) dereference() {
-	if n.key != nil {
-		key := make([]byte, len(n.key))
-		copy(key, n.key)
-		n.key = key
-		common.Assert(n.pgid == 0 || len(n.key) > 0, "dereference: zero-length node key on existing node")
-	}
-
-	for i := range n.inodes {
-		inode := &n.inodes[i]
-
-		key := make([]byte, len(inode.Key()))
-		copy(key, inode.Key())
-		inode.SetKey(key)
-		common.Assert(len(inode.Key()) > 0, "dereference: zero-length inode key")
-
-		value := make([]byte, len(inode.Value()))
-		copy(value, inode.Value())
-		inode.SetValue(value)
-	}
-
-	// Recursively dereference children.
-	for _, child := range n.children {
-		child.dereference()
-	}
-
-	// Update statistics.
-	n.bucket.tx.stats.IncNodeDeref(1)
-}
-
-// free adds the node's underlying page to the freelist.
-func (n *node) free() {
-	if n.pgid != 0 {
-		n.bucket.tx.db.freelist.Free(n.bucket.tx.meta.Txid(), n.bucket.tx.page(n.pgid))
-		n.pgid = 0
 	}
 }
 
@@ -506,7 +404,7 @@ func (n *node) dump() {
 	if n.isLeaf {
 		typ = "leaf"
 	}
-	warnf("[NODE %d {type=%s count=%d}]", n.pgid, typ, len(n.inodes))
+	warnf("[NODE %d {type=%s count=%d}]", n.nid, typ, len(n.inodes))
 
 	// Write out abbreviated version of each item.
 	for _, item := range n.inodes {
@@ -518,7 +416,7 @@ func (n *node) dump() {
 				warnf("+L %08x -> %08x", trunc(item.key, 4), trunc(item.value, 4))
 			}
 		} else {
-			warnf("+B %08x -> pgid=%d", trunc(item.key, 4), item.pgid)
+			warnf("+B %08x -> nid=%d", trunc(item.key, 4), item.nid)
 		}
 	}
 	warn("")
@@ -529,10 +427,10 @@ func compareKeys(left, right []byte) int {
 	return bytes.Compare(left, right)
 }
 
-type nodes []*node
+type workNodes []*workNode
 
-func (s nodes) Len() int      { return len(s) }
-func (s nodes) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
-func (s nodes) Less(i, j int) bool {
+func (s workNodes) Len() int      { return len(s) }
+func (s workNodes) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+func (s workNodes) Less(i, j int) bool {
 	return bytes.Compare(s[i].inodes[0].Key(), s[j].inodes[0].Key()) == -1
 }
