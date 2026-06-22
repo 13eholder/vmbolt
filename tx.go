@@ -1,6 +1,7 @@
 package vmbolt
 
 import (
+	"io"
 	"os"
 	"sort"
 	"sync/atomic"
@@ -390,13 +391,13 @@ func (tx *Tx) close() {
 }
 
 // Copy writes the entire database to a writer as a BMSP snapshot (see snapshot.go).
-func (tx *Tx) Copy(w errorWriter) error {
+func (tx *Tx) Copy(w io.Writer) error {
 	_, err := tx.WriteTo(w)
 	return err
 }
 
 // WriteTo writes the entire database to a writer as a BMSP snapshot.
-func (tx *Tx) WriteTo(w errorWriter) (n int64, err error) {
+func (tx *Tx) WriteTo(w io.Writer) (n int64, err error) {
 	return tx.serializeSnapshot(w)
 }
 
@@ -409,10 +410,6 @@ func (tx *Tx) CopyFile(path string, mode os.FileMode) error {
 	defer f.Close()
 	_, err = tx.WriteTo(f)
 	return err
-}
-
-type errorWriter interface {
-	Write(p []byte) (n int, err error)
 }
 
 // TxStats represents statistics about the actions performed by the transaction.
