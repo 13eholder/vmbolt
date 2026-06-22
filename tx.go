@@ -31,12 +31,11 @@ type Tx struct {
 	created map[string]*bucketHandle
 	deleted map[string]struct{}
 
-	// Cohort bookkeeping. cohortSnaps pins (per read tx) one cohortSnapshot per
-	// cohort so all its members are read from one generation. dirtyCohorts /
-	// adoptedStates drive write-tx cohort (re)publishing.
-	cohortSnaps   map[*bucketCohort]*cohortSnapshot
-	dirtyCohorts  map[*bucketCohort]struct{}
-	adoptedStates map[string]*bucketState // existing independent buckets adopted into a cohort this tx
+	// Commit-group bookkeeping. A read tx pins one commit-group snapshot per
+	// touched group so all its members are read from one generation. A write tx
+	// marks touched groups dirty so they are jointly republished at commit.
+	commitGroupSnaps  map[*bucketCommitGroup]*commitGroupSnapshot
+	dirtyCommitGroups map[*bucketCommitGroup]struct{}
 
 	stats          TxStats
 	commitHandlers []func()
@@ -179,56 +178,12 @@ func (tx *Tx) Bucket(name []byte) *Bucket {
 // it. The bucket is usable immediately within this tx; it is registered in the
 // DB directory at commit.
 func (tx *Tx) CreateBucket(name []byte) (*Bucket, error) {
-	if tx.db == nil {
-		return nil, berrors.ErrTxClosed
-	}
-	if !tx.writable {
-		return nil, berrors.ErrTxNotWritable
-	}
-	if len(name) == 0 {
-		return nil, berrors.ErrBucketNameRequired
-	}
-	key := string(name)
-	if _, deleted := tx.deleted[key]; !deleted {
-		if tx.created[key] != nil || tx.bucketExistsCommitted(key) {
-			return nil, berrors.ErrBucketExists
-		}
-	}
-	id := tx.db.allocBucketId()
-	h := &bucketHandle{id: id, name: key}
-	b := &Bucket{
-		tx:          tx,
-		name:        key,
-		handle:      h,
-		dirty:       make(map[common.Nid]*workNode),
-		obsolete:    make(map[common.Nid]struct{}),
-		FillPercent: DefaultFillPercent,
-	}
-	b.rootNode = &workNode{bucket: b, isLeaf: true}
-	if tx.created == nil {
-		tx.created = make(map[string]*bucketHandle)
-	}
-	tx.created[key] = h
-	delete(tx.deleted, key) // a delete-then-recreate cancels the deletion
-	tx.putBctx(key, b)
-	return b, nil
+	return tx.CreateBucketWithOptions(name, nil)
 }
 
 // CreateBucketIfNotExists creates a new bucket if it doesn't already exist.
 func (tx *Tx) CreateBucketIfNotExists(name []byte) (*Bucket, error) {
-	if tx.db == nil {
-		return nil, berrors.ErrTxClosed
-	}
-	if !tx.writable {
-		return nil, berrors.ErrTxNotWritable
-	}
-	if len(name) == 0 {
-		return nil, berrors.ErrBucketNameRequired
-	}
-	if b := tx.Bucket(name); b != nil {
-		return b, nil
-	}
-	return tx.CreateBucket(name)
+	return tx.CreateBucketIfNotExistsWithOptions(name, nil)
 }
 
 // DeleteBucket deletes a top-level bucket. The whole tree is discarded at
@@ -316,15 +271,15 @@ func (tx *Tx) putBctx(key string, b *Bucket) {
 }
 
 // Commit publishes each touched bucket. Independent buckets are published one
-// atomic Store each (per-bucket snapshot isolation). Buckets that share a cohort
-// (see Tx.AssignCohort) are published together via one cohort-snapshot Store, so
-// cohort members become visible atomically — no reader can see one member at a
+// atomic Store each (per-bucket snapshot isolation). Buckets that share a
+// commit group are published together via one group-snapshot Store, so
+// grouped buckets become visible atomically — no reader can see one member at a
 // newer generation than another.
 //
 // Pipeline:
 //  1. rebalance + spill (finalize) every touched bucket, assigning node ids;
 //  2. build each bucket's new immutable bucketState;
-//  3. publish under bucketsMu: independent buckets per-handle, dirty cohorts as
+//  3. publish under bucketsMu: independent buckets per-handle, dirty commit groups as
 //     rebuilt joint snapshots, plus pending create/delete.
 //
 // Steps 1-2 perform no publication, so a failure leaves nothing published and
@@ -387,22 +342,17 @@ func (tx *Tx) Commit() (err error) {
 
 	// Step 3: publish under the directory lock.
 	//   - touched INDEPENDENT buckets: per-handle atomic Store;
-	//   - each dirty cohort: rebuild its jointly-published snapshot (members at
-	//     their new state if touched/adopted this tx, else carried forward) and
+	//   - each dirty commit group: rebuild its jointly-published snapshot (members
+	//     at their new state if touched this tx, else carried forward) and
 	//     Store it once, so all members become visible atomically together.
-	newStates := make(map[string]*bucketState, len(pendings)+len(tx.adoptedStates))
+	newStates := make(map[string]*bucketState, len(pendings))
 	for _, p := range pendings {
 		newStates[p.handle.name] = p.state
 	}
-	for name, st := range tx.adoptedStates {
-		if _, ok := newStates[name]; !ok {
-			newStates[name] = st
-		}
-	}
-	// Any touched/adopted cohort member must trigger its cohort's joint republish.
+	// Any touched grouped bucket must trigger its group's joint republish.
 	for _, p := range pendings {
-		if p.handle.cohort != nil {
-			tx.markCohortDirty(p.handle.cohort)
+		if p.handle.commitGroup != nil {
+			tx.markCommitGroupDirty(p.handle.commitGroup)
 		}
 	}
 
@@ -413,11 +363,11 @@ func (tx *Tx) Commit() (err error) {
 			tx.db.buckets[p.handle.name] = p.handle
 		}
 	}
-	// 3b. apply deletes; mark any cohort dirty so its snapshot drops the member.
+	// 3b. apply deletes; mark any commit group dirty so its snapshot drops the member.
 	for name := range tx.deleted {
 		if h := tx.db.buckets[name]; h != nil {
-			if h.cohort != nil {
-				tx.markCohortDirty(h.cohort)
+			if h.commitGroup != nil {
+				tx.markCommitGroupDirty(h.commitGroup)
 			}
 			delete(tx.db.buckets, name)
 			tx.db.freeBucketId(h.id)
@@ -425,15 +375,15 @@ func (tx *Tx) Commit() (err error) {
 	}
 	// 3c. publish independent touched buckets.
 	for _, p := range pendings {
-		if p.handle.cohort == nil {
+		if p.handle.commitGroup == nil {
 			p.handle.state.Store(p.state)
 		}
 	}
-	// 3d. publish dirty cohorts: rebuild each from its current members.
-	for c := range tx.dirtyCohorts {
+	// 3d. publish dirty commit groups: rebuild each from its current members.
+	for g := range tx.dirtyCommitGroups {
 		members := make(map[string]*bucketState)
 		for name, h := range tx.db.buckets {
-			if h.cohort != c {
+			if h.commitGroup != g {
 				continue
 			}
 			if st := newStates[name]; st != nil {
@@ -442,7 +392,7 @@ func (tx *Tx) Commit() (err error) {
 				members[name] = publishedStateOf(h) // carry untouched member forward
 			}
 		}
-		c.state.Store(&cohortSnapshot{members: members})
+		g.state.Store(&commitGroupSnapshot{members: members})
 	}
 	tx.db.bucketsMu.Unlock()
 
@@ -490,13 +440,6 @@ func (tx *Tx) rollback() {
 		for _, h := range tx.created {
 			tx.db.freeBucketId(h.id)
 		}
-		// Undo cohort adoptions: an adopted bucket's cohort was set but never
-		// published (no commit), so detach it to avoid a set-but-orphaned cohort.
-		for name := range tx.adoptedStates {
-			if h := tx.db.buckets[name]; h != nil {
-				h.cohort = nil
-			}
-		}
 	}
 	tx.close()
 }
@@ -538,9 +481,8 @@ func (tx *Tx) close() {
 	tx.bctx = nil
 	tx.created = nil
 	tx.deleted = nil
-	tx.cohortSnaps = nil
-	tx.dirtyCohorts = nil
-	tx.adoptedStates = nil
+	tx.commitGroupSnaps = nil
+	tx.dirtyCommitGroups = nil
 }
 
 // Copy writes the entire database to a writer as a BMSP snapshot (see snapshot.go).

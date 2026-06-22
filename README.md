@@ -31,7 +31,7 @@
   - [Read snapshot isolation](#read-snapshot-isolation)
   - [Single writer](#single-writer)
 - [Snapshots & restore (BMSP)](#snapshots--restore-bmsp)
-- [Cohorts: atomic bucket groups](#cohorts-atomic-bucket-groups)
+- [Commit Groups: atomic bucket groups](#commit-groups-atomic-bucket-groups)
 - [API reference](#api-reference)
 - [Differences from bbolt](#differences-from-bbolt)
 - [Caveats & limitations](#caveats--limitations)
@@ -170,24 +170,24 @@ background persistence. Between snapshots, data is volatile.
 
 ---
 
-## Cohorts: atomic bucket groups
+## Commit Groups: atomic bucket groups
 
 By default buckets are published independently, so there is **no cross-bucket
 atomicity**. Some workloads (notably etcd's `consistent_index` vs its MVCC
 `key` tree) need a small set of buckets to be observed **jointly**. vmbolt
-provides a *cohort* for exactly that:
+provides a *commit group* for exactly that:
 
 ```go
-ag := db.NewCohort()
+ag := db.NewCommitGroup()
 _ = db.Update(func(tx *vmbolt.Tx) error {
-	if _, err := tx.AssignCohort([]byte("meta"), ag); err != nil { return err }
-	_, err := tx.AssignCohort([]byte("key"), ag)
+	if _, err := tx.CreateBucketWithOptions([]byte("meta"), &vmbolt.BucketOptions{CommitGroup: ag}); err != nil { return err }
+	_, err := tx.CreateBucketWithOptions([]byte("key"), &vmbolt.BucketOptions{CommitGroup: ag})
 	return err
 })
 ```
 
-Members of a cohort share one atomic publication point: a reader loading the
-cohort snapshot sees **all members at one consistent generation**. Non-member
+Members of a commit group share one atomic publication point: a reader loading the
+group snapshot sees **all members at one consistent generation**. Non-member
 buckets keep being published independently, so the cost is paid only by the
 buckets that actually need joint consistency.
 
@@ -203,7 +203,7 @@ Database:
 | `Close()` | Release resources |
 | `Update(fn)` / `View(fn)` / `Batch(fn)` | Managed read-write / read-only / batched tx |
 | `Begin(writable)` | Manual transaction (remember to `Commit`/`Rollback`) |
-| `NewCohort()` | Create an atomic bucket group |
+| `NewCommitGroup()` | Create an atomic bucket group |
 | `Restore(r)` | Rehydrate from a BMSP reader |
 | `Stats()`, `Info()`, `Path()`, `Logger()` | Diagnostics |
 
@@ -212,7 +212,7 @@ Transaction:
 | Method | Notes |
 |--------|-------|
 | `Bucket(name)` | Open a top-level bucket (nil if absent) |
-| `CreateBucket` / `CreateBucketIfNotExists` / `DeleteBucket` | Bucket lifecycle |
+| `CreateBucket` / `CreateBucketIfNotExists` / `CreateBucketWithOptions` / `CreateBucketIfNotExistsWithOptions` / `DeleteBucket` | Bucket lifecycle |
 | `ForEach(fn)` | Iterate top-level buckets (**unordered** — map iteration) |
 | `Cursor()` | Sorted cursor over top-level **bucket names** (deterministic) |
 | `Size()` | Whole-DB logical size estimate |
@@ -248,7 +248,7 @@ Added:
 
 - Per-bucket atomic publish, `Nid = BucketId|NodeId`, per-bucket id recycling.
 - BMSP snapshot format + `Open` auto-restore.
-- `Tx.Cursor()` over sorted top-level bucket names; cohorts for joint atomicity.
+- `Tx.Cursor()` over sorted top-level bucket names; commit groups for joint atomicity.
 
 ---
 
@@ -258,7 +258,7 @@ Added:
   snapshot. vmbolt is *not* a replacement for a durable store.
 - **Single writer.** One write transaction at a time (global lock). Reads are
   concurrent with the writer.
-- **No cross-bucket atomicity by default.** Use a [cohort](#cohorts-atomic-bucket-groups)
+- **No cross-bucket atomicity by default.** Use a [commit group](#commit-groups-atomic-bucket-groups)
   for the buckets that must advance together.
 - **Lazy per-bucket read snapshot.** A read tx pins each bucket on first access,
   not at `Begin`; a long-lived read tx that waits before reading a bucket will
@@ -281,7 +281,7 @@ present:
 - sorted `Tx.Cursor()` (deterministic `Hash`/snapshot),
 - `Tx.WriteTo`/snapshot streaming (BMSP),
 - `Tx.Size()`,
-- a cohort so `meta` + `key` stay jointly consistent.
+- a commit group so `meta` + `key` stay jointly consistent.
 
 The fundamental gap is **durability**: etcd requires a durable, recoverable
 backend, while vmbolt is memory-only (snapshot-on-demand, volatile between

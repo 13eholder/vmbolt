@@ -57,16 +57,12 @@ func newBucketForHandle(tx *Tx, name string, h *bucketHandle) *Bucket {
 		handle:      h,
 		FillPercent: DefaultFillPercent,
 	}
-	// Resolve the pinned generation (read view / COW base). For a cohort member
-	// the state lives in the cohort's jointly-published snapshot (pinned per tx);
+	// Resolve the pinned generation (read view / COW base). For a grouped bucket
+	// the state lives in the group's jointly-published snapshot (pinned per tx);
 	// for an independent bucket it lives in the handle's own atomic pointer.
-	if h.cohort != nil {
-		if snap := tx.pinCohort(h.cohort); snap != nil {
+	if h.commitGroup != nil {
+		if snap := tx.pinCommitGroup(h.commitGroup); snap != nil {
 			b.base = snap.members[name]
-		}
-		if b.base == nil {
-			// adoption transition / not-yet-committed member: fall back to own state
-			b.base = h.state.Load()
 		}
 	} else {
 		b.base = h.state.Load()

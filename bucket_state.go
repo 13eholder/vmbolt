@@ -30,43 +30,40 @@ type bucketHandle struct {
 
 	state atomic.Pointer[bucketState]
 
-	// cohort, if non-nil, makes this bucket a member of an atomic group: its
-	// published state then lives in cohort.state's snapshot (NOT in state), and
-	// readers observe all members of the cohort at one consistent generation.
+	// commitGroup, if non-nil, makes this bucket a member of an atomic group: its
+	// published state then lives in commitGroup.state's snapshot (NOT in state),
+	// and readers observe all members of the group at one consistent generation.
 	// nil (the default) keeps the bucket published independently via state.
-	cohort *bucketCohort
+	commitGroup *bucketCommitGroup
 
 	// Writer-private node-id allocator (low-48 NodeId space of this bucket).
 	nextNodeId  uint64
 	freeNodeIds []uint64 // LIFO stack of recyclable node ids
 }
 
-// bucketCohort is an atomic publication group. Member buckets share a single
-// atomic.Pointer[cohortSnapshot]: a reader that loads it observes every member
+// bucketCommitGroup is an atomic publication group. Member buckets share a
+// single atomic.Pointer[commitGroupSnapshot]: a reader that loads it observes every member
 // at one consistent generation (jointly atomic), while non-member buckets keep
 // being published independently. This lets etcd keep its `meta`+`key` buckets
 // jointly consistent (consistent_index vs data) without re-coupling the rest.
-type bucketCohort struct {
-	state atomic.Pointer[cohortSnapshot]
+type bucketCommitGroup struct {
+	state atomic.Pointer[commitGroupSnapshot]
 }
 
-// cohortSnapshot is the immutable, jointly-published set of member states.
-type cohortSnapshot struct {
+// commitGroupSnapshot is the immutable, jointly-published set of member states.
+type commitGroupSnapshot struct {
 	members map[string]*bucketState
 }
 
 // publishedStateOf returns the bucket's currently-published state: from its
-// cohort snapshot if it is a cohort member, else from its own atomic pointer.
-// For a cohort member not yet present in a published snapshot (just adopted or
-// freshly created this tx), it falls back to its own pointer.
+// group snapshot if it is a grouped member, else from its own atomic pointer.
 func publishedStateOf(h *bucketHandle) *bucketState {
-	if h.cohort != nil {
-		if snap := h.cohort.state.Load(); snap != nil {
+	if h.commitGroup != nil {
+		if snap := h.commitGroup.state.Load(); snap != nil {
 			if s, ok := snap.members[h.name]; ok {
 				return s
 			}
 		}
-		return h.state.Load()
 	}
 	return h.state.Load()
 }

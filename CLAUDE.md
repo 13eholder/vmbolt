@@ -63,9 +63,9 @@ and there is no shared on-disk page layer.
   build-all-then-publish-all so a failed commit publishes nothing. A read tx pins each
   bucket's generation **on first access, not at `Begin`**, so a single read tx may observe
   different buckets at different generations. This is intentional.
-- **Cohorts** (`bucket_state.go`, `cohort.go`) — buckets that must be observed jointly
-  (e.g. etcd's `meta`+`key`) share one `atomic.Pointer[cohortSnapshot]`.
-  `publishedStateOf()` routes a cohort member's reads through the cohort snapshot instead
+- **Commit groups** (`bucket_state.go`, `commit_group.go`) — buckets that must be observed jointly
+  (e.g. etcd's `meta`+`key`) share one `atomic.Pointer[commitGroupSnapshot]`.
+  `publishedStateOf()` routes a grouped bucket's reads through the group snapshot instead
   of its own pointer.
 - **BMSP snapshots** (`snapshot.go`) — non-durable by design, but `Tx.WriteTo`/`CopyFile`
   and `DB.Restore` serialize/restore the whole DB as a deterministic streaming KV dump
@@ -76,7 +76,7 @@ and there is no shared on-disk page layer.
 ## Key packages
 
 - `.` — `DB`, `Tx`, `Bucket`, `Cursor`, `node`, `snapNode`/`workNode`, `bucketState`/`bucketHandle`,
-  `bucketCohort`, BMSP serialize/restore.
+  `bucketCommitGroup`, BMSP serialize/restore.
 - `internal/common` — shared low-level types only: `Nid`, `BucketId`, `Inode`/`Inodes`,
   `Txid`, defaults. (No page/mmap code — that was deleted upstream.)
 - `internal/btesting` — test `DB` helpers (`MustCreateDB`, `MustReopen`, cleanup); wires

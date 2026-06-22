@@ -8,19 +8,19 @@ import (
 	"testing"
 )
 
-// TestCohort_BasicCRUD creates two cohort members, writes/reads them, and checks
-// they resolve through the cohort snapshot.
-func TestCohort_BasicCRUD(t *testing.T) {
+// TestCommitGroup_BasicCRUD creates two grouped buckets, writes/reads them, and
+// checks they resolve through the group snapshot.
+func TestCommitGroup_BasicCRUD(t *testing.T) {
 	db := mustOpenMem(t)
 	defer db.Close()
 
-	ag := db.NewCohort()
+	g := db.NewCommitGroup()
 	mustOk(t, db.Update(func(tx *Tx) error {
-		meta, err := tx.AssignCohort([]byte("meta"), ag)
+		meta, err := tx.CreateBucketWithOptions([]byte("meta"), &BucketOptions{CommitGroup: g})
 		if err != nil {
 			return err
 		}
-		key, err := tx.AssignCohort([]byte("key"), ag)
+		key, err := tx.CreateBucketWithOptions([]byte("key"), &BucketOptions{CommitGroup: g})
 		if err != nil {
 			return err
 		}
@@ -39,27 +39,22 @@ func TestCohort_BasicCRUD(t *testing.T) {
 		if string(key.Get([]byte("k1"))) != "v1" {
 			t.Fatalf("key.k1 = %q", key.Get([]byte("k1")))
 		}
-		// Both handles must share the same cohort, and the cohort snapshot must
-		// carry both members.
+
 		tx.db.bucketsMu.RLock()
 		hm := tx.db.buckets["meta"]
 		hk := tx.db.buckets["key"]
 		tx.db.bucketsMu.RUnlock()
-		if hm.cohort == nil || hm.cohort != hk.cohort {
-			t.Fatalf("meta/key not in same cohort: %p vs %p", hm.cohort, hk.cohort)
+		if hm.commitGroup == nil || hm.commitGroup != hk.commitGroup {
+			t.Fatalf("meta/key not in same commit group: %p vs %p", hm.commitGroup, hk.commitGroup)
 		}
-		snap := hm.cohort.state.Load()
+		snap := hm.commitGroup.state.Load()
 		if snap == nil || len(snap.members) != 2 {
-			t.Fatalf("cohort snapshot members = %d (want 2)", mapLen(snap))
+			t.Fatalf("commit-group snapshot members = %d (want 2)", groupLen(snap))
 		}
 		return nil
 	}))
 
-	if s := mustSize(t, db); s <= 0 {
-		t.Fatalf("size = %d, want > 0", s)
-	}
-
-	// A third, independent bucket is NOT in the cohort.
+	// A third, independent bucket is NOT in the group.
 	mustOk(t, db.Update(func(tx *Tx) error {
 		b, err := tx.CreateBucket([]byte("solo"))
 		if err != nil {
@@ -71,35 +66,33 @@ func TestCohort_BasicCRUD(t *testing.T) {
 		tx.db.bucketsMu.RLock()
 		hs := tx.db.buckets["solo"]
 		tx.db.bucketsMu.RUnlock()
-		if hs.cohort != nil {
-			t.Fatal("solo bucket should be independent (no cohort)")
+		if hs.commitGroup != nil {
+			t.Fatal("solo bucket should be independent (no commit group)")
 		}
 		return nil
 	}))
 }
 
-func mapLen(s *cohortSnapshot) int {
+func groupLen(s *commitGroupSnapshot) int {
 	if s == nil {
 		return -1
 	}
 	return len(s.members)
 }
 
-// TestCohort_JointAtomicVisibility drives a writer that advances meta.ci and
-// key.maxv together, and a concurrent reader that asserts they are always equal.
-// With the cohort they share one atomic publication point, so a reader can never
-// observe one member at a newer generation than the other.
-func TestCohort_JointAtomicVisibility(t *testing.T) {
+// TestCommitGroup_JointAtomicVisibility drives a writer that advances meta.v and
+// key.v together, and a concurrent reader that asserts they are always equal.
+func TestCommitGroup_JointAtomicVisibility(t *testing.T) {
 	db := mustOpenMem(t)
 	defer db.Close()
 
-	ag := db.NewCohort()
+	g := db.NewCommitGroup()
 	mustOk(t, db.Update(func(tx *Tx) error {
-		meta, err := tx.AssignCohort([]byte("meta"), ag)
+		meta, err := tx.CreateBucketWithOptions([]byte("meta"), &BucketOptions{CommitGroup: g})
 		if err != nil {
 			return err
 		}
-		key, err := tx.AssignCohort([]byte("key"), ag)
+		key, err := tx.CreateBucketWithOptions([]byte("key"), &BucketOptions{CommitGroup: g})
 		if err != nil {
 			return err
 		}
@@ -146,87 +139,86 @@ func TestCohort_JointAtomicVisibility(t *testing.T) {
 
 	wg.Wait()
 	if mismatches != 0 {
-		t.Fatalf("cohort observed %d inconsistent reads (meta.v != key.v)", mismatches)
+		t.Fatalf("commit group observed %d inconsistent reads (meta.v != key.v)", mismatches)
 	}
 }
 
-// TestCohort_AdoptExisting creates two independent buckets, then adopts them
-// into a cohort, and verifies data survives + they become jointly published.
-func TestCohort_AdoptExisting(t *testing.T) {
+// TestCommitGroup_ExistingBucketCannotJoinGroup verifies there is no runtime
+// adopt path: a committed independent bucket cannot later be recreated into a
+// commit group.
+func TestCommitGroup_ExistingBucketCannotJoinGroup(t *testing.T) {
 	db := mustOpenMem(t)
 	defer db.Close()
 
-	// Independent buckets with data.
 	mustOk(t, db.Update(func(tx *Tx) error {
 		meta, err := tx.CreateBucket([]byte("meta"))
 		if err != nil {
 			return err
 		}
-		key, err := tx.CreateBucket([]byte("key"))
-		if err != nil {
-			return err
-		}
-		if err := meta.Put([]byte("ci"), []byte("7")); err != nil {
-			return err
-		}
-		return key.Put([]byte("k"), []byte("v"))
+		return meta.Put([]byte("ci"), []byte("7"))
 	}))
 
-	// Adopt both into a cohort in one tx.
-	ag := db.NewCohort()
-	mustOk(t, db.Update(func(tx *Tx) error {
-		if _, err := tx.AssignCohort([]byte("meta"), ag); err != nil {
-			return err
-		}
-		_, err := tx.AssignCohort([]byte("key"), ag)
+	g := db.NewCommitGroup()
+	err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateBucketIfNotExistsWithOptions([]byte("meta"), &BucketOptions{CommitGroup: g})
 		return err
-	}))
+	})
+	if err == nil {
+		t.Fatal("expected group mismatch error when trying to join an existing bucket to a commit group")
+	}
 
-	// Data survives adoption and reads route through the cohort.
 	mustOk(t, db.View(func(tx *Tx) error {
 		if string(tx.Bucket([]byte("meta")).Get([]byte("ci"))) != "7" {
-			t.Fatal("meta.ci lost on adopt")
-		}
-		if string(tx.Bucket([]byte("key")).Get([]byte("k"))) != "v" {
-			t.Fatal("key.k lost on adopt")
+			t.Fatal("meta.ci changed after rejected adopt")
 		}
 		tx.db.bucketsMu.RLock()
 		hm := tx.db.buckets["meta"]
-		hk := tx.db.buckets["key"]
 		tx.db.bucketsMu.RUnlock()
-		if hm.cohort == nil || hm.cohort != hk.cohort {
-			t.Fatal("adopted buckets not in same cohort")
-		}
-		if snap := hm.cohort.state.Load(); snap == nil || len(snap.members) != 2 {
-			t.Fatalf("cohort members after adopt = %d", mapLen(snap))
-		}
-		return nil
-	}))
-
-	// Further writes go through the cohort.
-	mustOk(t, db.Update(func(tx *Tx) error {
-		return tx.Bucket([]byte("meta")).Put([]byte("ci"), []byte("8"))
-	}))
-	mustOk(t, db.View(func(tx *Tx) error {
-		if string(tx.Bucket([]byte("meta")).Get([]byte("ci"))) != "8" {
-			t.Fatal("post-adopt write lost")
+		if hm.commitGroup != nil {
+			t.Fatal("independent bucket unexpectedly joined a commit group")
 		}
 		return nil
 	}))
 }
 
-// TestCohort_DeleteMember deletes one cohort member and verifies the other is
-// unaffected and the cohort snapshot no longer carries the deleted one.
-func TestCohort_DeleteMember(t *testing.T) {
+// TestCommitGroup_CreateBucketIfNotExists_MatchingGroup returns the existing
+// bucket when the requested group matches.
+func TestCommitGroup_CreateBucketIfNotExists_MatchingGroup(t *testing.T) {
 	db := mustOpenMem(t)
 	defer db.Close()
 
-	ag := db.NewCohort()
+	g := db.NewCommitGroup()
 	mustOk(t, db.Update(func(tx *Tx) error {
-		if _, err := tx.AssignCohort([]byte("meta"), ag); err != nil {
+		if _, err := tx.CreateBucketWithOptions([]byte("meta"), &BucketOptions{CommitGroup: g}); err != nil {
 			return err
 		}
-		if _, err := tx.AssignCohort([]byte("key"), ag); err != nil {
+		b, err := tx.CreateBucketIfNotExistsWithOptions([]byte("meta"), &BucketOptions{CommitGroup: g})
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte("ci"), []byte("9"))
+	}))
+
+	mustOk(t, db.View(func(tx *Tx) error {
+		if string(tx.Bucket([]byte("meta")).Get([]byte("ci"))) != "9" {
+			t.Fatal("meta.ci write lost")
+		}
+		return nil
+	}))
+}
+
+// TestCommitGroup_DeleteMember deletes one grouped bucket and verifies the other
+// is unaffected and the group snapshot no longer carries the deleted member.
+func TestCommitGroup_DeleteMember(t *testing.T) {
+	db := mustOpenMem(t)
+	defer db.Close()
+
+	g := db.NewCommitGroup()
+	mustOk(t, db.Update(func(tx *Tx) error {
+		if _, err := tx.CreateBucketWithOptions([]byte("meta"), &BucketOptions{CommitGroup: g}); err != nil {
+			return err
+		}
+		if _, err := tx.CreateBucketWithOptions([]byte("key"), &BucketOptions{CommitGroup: g}); err != nil {
 			return err
 		}
 		return tx.Bucket([]byte("meta")).Put([]byte("ci"), []byte("1"))
@@ -241,17 +233,17 @@ func TestCohort_DeleteMember(t *testing.T) {
 			t.Fatal("key bucket should be gone")
 		}
 		if string(tx.Bucket([]byte("meta")).Get([]byte("ci"))) != "1" {
-			t.Fatal("meta data lost after deleting cohort sibling")
+			t.Fatal("meta data lost after deleting grouped sibling")
 		}
 		tx.db.bucketsMu.RLock()
 		hm := tx.db.buckets["meta"]
 		tx.db.bucketsMu.RUnlock()
-		if snap := hm.cohort.state.Load(); snap != nil {
+		if snap := hm.commitGroup.state.Load(); snap != nil {
 			if _, ok := snap.members["key"]; ok {
-				t.Fatal("deleted member still in cohort snapshot")
+				t.Fatal("deleted member still in commit-group snapshot")
 			}
 			if len(snap.members) != 1 {
-				t.Fatalf("cohort members after delete = %d (want 1)", len(snap.members))
+				t.Fatalf("commit-group members after delete = %d (want 1)", len(snap.members))
 			}
 		}
 		return nil
