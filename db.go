@@ -104,6 +104,9 @@ func Open(path string, mode os.FileMode, options *Options) (db *DB, err error) {
 		_ = db.close()
 		return nil, err
 	}
+	// Mark the DB as open before any write path runs: maybeRestore() below
+	// calls Restore -> Update -> Begin(true), which checks db.opened.
+	db.opened.Store(true)
 
 	// If the path holds a BMSP snapshot, rehydrate from it. This adds no
 	// per-commit persistence: the snapshot is only written on demand (via
@@ -114,9 +117,7 @@ func Open(path string, mode os.FileMode, options *Options) (db *DB, err error) {
 			return nil, rerr
 		}
 	}
-	db.opened.Store(true)
 
-	// Mark the database as opened and return.
 	return db, nil
 }
 
