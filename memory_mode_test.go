@@ -9,7 +9,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	berrors "13eholder/vmbolt/errors"
 )
 
 func TestMemoryMode_BasicCRUD(t *testing.T) {
@@ -66,24 +65,6 @@ func TestMemoryMode_BasicCRUD(t *testing.T) {
 		b := tx.Bucket([]byte("test"))
 		v := b.Get([]byte("hello"))
 		require.Nil(t, v)
-		return nil
-	})
-	require.NoError(t, err)
-}
-
-func TestMemoryMode_NestedBuckets(t *testing.T) {
-	db, err := Open("memory-nested.db", 0600, nil)
-	require.NoError(t, err)
-	defer db.Close()
-
-	err = db.Update(func(tx *Tx) error {
-		root, err := tx.CreateBucket([]byte("root"))
-		if err != nil {
-			return err
-		}
-		child, err := root.CreateBucket([]byte("child"))
-		require.Nil(t, child)
-		require.ErrorIs(t, err, berrors.ErrNestedBucketsUnsupported)
 		return nil
 	})
 	require.NoError(t, err)

@@ -140,7 +140,7 @@ func TestPerBucketSanity(t *testing.T) {
 		return nil
 	}))
 
-	// Recreate a deleted bucket name (BucketId recycling).
+	// Recreate a deleted bucket name.
 	mustOk(t, db.Update(func(tx *Tx) error {
 		b, err := tx.CreateBucket([]byte("b"))
 		if err != nil {

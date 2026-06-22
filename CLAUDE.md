@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `vmbolt` (module `13eholder/vmbolt`, package `vmbolt`) is a **pure-memory** key/value
 store forked from [bbolt](https://github.com/etcd-io/bbolt). The disk stack (mmap file,
 WAL, fsync, file lock, freelist package, `cmd/bbolt` CLI, `tests/*`) has been removed; the
-engine is an in-memory, per-bucket B+tree that keeps bbolt's `DB`/`Tx`/`Bucket`/`Cursor`
+engine is an in-memory flat-bucket B+tree store with globally consistent transaction views that keeps bbolt's `DB`/`Tx`/`Bucket`/`Cursor`
 API shape. The README is authoritative for the data model and API — read it first.
 
 ## Commands
@@ -42,31 +42,24 @@ cross-arch, robustness, benchmark, and failpoint workflows were intentionally de
 
 ## Architecture
 
-The core idea: **each top-level bucket is an independently, atomically published B+tree**,
+The core idea: there is **one globally published immutable dbState per commit**,
 and there is no shared on-disk page layer.
 
-- **Per-bucket publish** — `DB.buckets` is a `map[string]*bucketHandle`. Each
-  `bucketHandle` owns an `atomic.Pointer[bucketState]`; readers dereference it lock-free.
-  `bucketState` (`bucket_state.go`) is the immutable published generation:
-  `{id, root Nid, nodes map[Nid]*snapNode}`. A commit rebuilds and republishes
-  *only the buckets the tx touched*.
+- **Global publish** — `DB.state` is an `atomic.Pointer[dbState]`. `dbState`
+  holds the top-level bucket directory plus the global nid allocator snapshot.
+  Readers pin one `dbState` at `Begin`, so one read tx sees one consistent view
+  across all buckets.
 - **Two node shapes** (`snapshot_node.go`) — `snapNode` is immutable and shared across
   transactions; `workNode` is tx-local and mutable. Copy-on-write flows through
   `snapNode.materializeWorkNode()` (read→write) and `workNode.freeze()` (write→published,
   zero-copy inode-slice transfer). Both shell types are recycled via `sync.Pool`
   (`workNodePool`, `inodesPool`); inode/key/value bytes are never retained across reuse.
-- **Nid layout** (`internal/common/nid.go`) — a node id is 64 bits: high 16 = `BucketId`
-  (≤65535, recycled on bucket delete; 0 reserved), low 48 = bucket-local `NodeId`
-  (recycled LIFO per bucket via `bucketHandle.freeNodeIds`). This makes every Nid globally
-  unique and self-routing (`Nid.BucketOf()`).
-- **Single writer, lazy read snapshot** — one global write lock (`DB.rwlock`); commit is
-  build-all-then-publish-all so a failed commit publishes nothing. A read tx pins each
-  bucket's generation **on first access, not at `Begin`**, so a single read tx may observe
-  different buckets at different generations. This is intentional.
-- **Commit groups** (`bucket_state.go`, `commit_group.go`) — buckets that must be observed jointly
-  (e.g. etcd's `meta`+`key`) share one `atomic.Pointer[commitGroupSnapshot]`.
-  `publishedStateOf()` routes a grouped bucket's reads through the group snapshot instead
-  of its own pointer.
+- **Global Nid allocator** (`internal/common/nid.go`) — `Nid` is a globally unique
+  uint64. The allocator state lives in `dbState` and is snapshotted into write txs;
+  freed ids are recycled LIFO.
+- **Single writer, global read snapshot** — one global write lock (`DB.rwlock`); commit is
+  build-all-then-publish so a failed commit publishes nothing. A read tx pins the
+  current `dbState` at `Begin`.
 - **BMSP snapshots** (`snapshot.go`) — non-durable by design, but `Tx.WriteTo`/`CopyFile`
   and `DB.Restore` serialize/restore the whole DB as a deterministic streaming KV dump
   (buckets sorted by name via `Tx.Cursor`, keys sorted within each bucket). `Open(path)`
@@ -75,13 +68,13 @@ and there is no shared on-disk page layer.
 
 ## Key packages
 
-- `.` — `DB`, `Tx`, `Bucket`, `Cursor`, `node`, `snapNode`/`workNode`, `bucketState`/`bucketHandle`,
-  `bucketCommitGroup`, BMSP serialize/restore.
-- `internal/common` — shared low-level types only: `Nid`, `BucketId`, `Inode`/`Inodes`,
+- `.` — `DB`, `Tx`, `Bucket`, `Cursor`, `node`, `snapNode`/`workNode`, `bucketState`,
+  `dbState`, BMSP serialize/restore.
+- `internal/common` — shared low-level types only: `Nid`, `Inode`/`Inodes`,
   `Txid`, defaults. (No page/mmap code — that was deleted upstream.)
 - `internal/btesting` — test `DB` helpers (`MustCreateDB`, `MustReopen`, cleanup); wires
   `TEST_ENABLE_STRICT_MODE`.
-- `errors` — sentinel errors (`ErrBucketNotFound`, `ErrTxClosed`, `ErrNestedBucketsUnsupported`, …).
+- `errors` — sentinel errors (`ErrBucketNotFound`, `ErrTxClosed`, …).
 - `version` — version metadata.
 
 ## Fork-specific gotchas
@@ -91,8 +84,7 @@ and there is no shared on-disk page layer.
   still carries disk-era sentinels (`ErrInvalidMapping`, `ErrChecksum`,
   `ErrVersionMismatch`, `ErrFreePagesNotLoaded`, …) retained only for API compatibility.
   Trust the README and `bucket_state.go`/`snapshot*.go`/`nid.go` comments over legacy text.
-- **Flat buckets only.** No nested buckets — returns `ErrNestedBucketsUnsupported`.
-  `Tx.Check` is a no-op stub.
+- **Flat buckets only.** No nested buckets. `Tx.Check` is a no-op stub.
 - **Lint import ordering may be stale.** `.golangci.yaml` sets the local import prefix to
   `go.etcd.io` (gci section + goimports `local-prefixes`), but the module is now
   `13eholder/vmbolt`. `13eholder/vmbolt` imports therefore sort as third-party under lint.

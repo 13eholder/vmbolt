@@ -9,7 +9,6 @@ import (
 
 func TestTxStats_add(t *testing.T) {
 	statsA := TxStats{
-		PageCount:     1,
 		CursorCount:   3,
 		NodeCount:     100,
 		NodeDeref:     101,
@@ -23,7 +22,6 @@ func TestTxStats_add(t *testing.T) {
 	}
 
 	statsB := TxStats{
-		PageCount:     2,
 		CursorCount:   4,
 		NodeCount:     101,
 		NodeDeref:     102,
@@ -37,7 +35,6 @@ func TestTxStats_add(t *testing.T) {
 	}
 
 	statsB.add(&statsA)
-	assert.Equal(t, int64(3), statsB.GetPageCount())
 	assert.Equal(t, int64(7), statsB.GetCursorCount())
 	assert.Equal(t, int64(201), statsB.GetNodeCount())
 	assert.Equal(t, int64(203), statsB.GetNodeDeref())

@@ -13,29 +13,27 @@ import (
 
 // Tx represents a read-only or read/write transaction on the database.
 //
-// In the per-bucket model a Tx does not hold a global snapshot. Instead it
-// lazily opens a per-bucket context (*Bucket) on first access. A read Tx pins
-// each touched bucket's current generation (per-bucket snapshot isolation); a
-// write Tx accumulates dirty workNodes per touched bucket and publishes each
-// touched bucket independently at commit. There is deliberately no
-// cross-bucket atomicity.
+// Every transaction pins one globally consistent dbState at Begin time. A
+// write tx mutates tx-local buckets and publishes one new dbState atomically
+// at commit.
 type Tx struct {
 	writable bool
 	managed  bool
 	db       *DB
 
+	id   uint64
+	base *dbState
+
 	// Per-bucket tx-local contexts, created lazily by Bucket/CreateBucket/etc.
 	bctx map[string]*Bucket
 
-	// Pending bucket-directory mutations, applied at commit (build-all-then-publish-all).
-	created map[string]*bucketHandle
+	// Pending bucket-directory mutations.
+	created map[string]struct{}
 	deleted map[string]struct{}
 
-	// Commit-group bookkeeping. A read tx pins one commit-group snapshot per
-	// touched group so all its members are read from one generation. A write tx
-	// marks touched groups dirty so they are jointly republished at commit.
-	commitGroupSnaps  map[*bucketCommitGroup]*commitGroupSnapshot
-	dirtyCommitGroups map[*bucketCommitGroup]struct{}
+	// Writer-private global nid allocator snapshot.
+	nextNid  uint64
+	freeNids []common.Nid
 
 	stats          TxStats
 	commitHandlers []func()
@@ -56,38 +54,21 @@ func (tx *Tx) Stats() TxStats {
 	return tx.stats
 }
 
-// Size returns the logical payload size of the whole database view in bytes
-// (the sum of every bucket's node-content estimate, using the tx-local view for
-// buckets touched by this tx and the committed generation for the rest). It is
-// an in-memory estimate, not a persisted file size.
+// Size returns the logical payload size of the whole database view in bytes.
 func (tx *Tx) Size() int64 {
 	var size int64
 	seen := make(map[string]bool, len(tx.bctx))
 
-	// Committed buckets.
-	tx.db.bucketsMu.RLock()
-	type committed struct {
-		name string
-		h    *bucketHandle
-	}
-	committedBuckets := make([]committed, 0, len(tx.db.buckets))
-	for n, h := range tx.db.buckets {
-		committedBuckets = append(committedBuckets, committed{n, h})
-	}
-	tx.db.bucketsMu.RUnlock()
-	for _, c := range committedBuckets {
-		seen[c.name] = true
-		if b := tx.bctx[c.name]; b != nil {
-			size += b.size() // tx-local view (dirty/base/obsolete)
+	for name, st := range tx.base.buckets {
+		seen[name] = true
+		if b := tx.bctx[name]; b != nil {
+			size += b.size()
 			continue
 		}
-		if st := publishedStateOf(c.h); st != nil {
-			for _, sn := range st.nodes {
-				size += int64(sn.size())
-			}
+		for _, sn := range st.nodes {
+			size += int64(sn.size())
 		}
 	}
-	// Buckets created in this tx (not yet in db.buckets).
 	for name, b := range tx.bctx {
 		if seen[name] {
 			continue
@@ -98,8 +79,7 @@ func (tx *Tx) Size() int64 {
 }
 
 // Inspect returns the structure of the database: a synthetic "root" whose
-// children are the top-level buckets. (There is no real root bucket in the
-// per-bucket model; this aggregates for diagnostic compatibility.)
+// children are the top-level buckets.
 func (tx *Tx) Inspect() BucketStructure {
 	root := BucketStructure{Name: "root"}
 	_ = tx.ForEach(func(name []byte, b *Bucket) error {
@@ -109,21 +89,15 @@ func (tx *Tx) Inspect() BucketStructure {
 	return root
 }
 
-// Cursor returns a directory cursor over the top-level bucket NAMES in sorted
-// (lexicographic) order. It yields (bucketName, nil) per entry; use tx.Bucket(name)
-// to open the bucket itself. This replaces the legacy root-bucket cursor and keeps
-// enumeration deterministic (required by Hash/snapshot/defrag-style callers).
+// Cursor returns a directory cursor over the top-level bucket names in sorted order.
 func (tx *Tx) Cursor() *Cursor {
 	if tx.db == nil {
 		return &Cursor{}
 	}
-	// Snapshot the bucket-name set (committed ∪ created − deleted) and sort it.
 	nameSet := map[string]struct{}{}
-	tx.db.bucketsMu.RLock()
-	for n := range tx.db.buckets {
+	for n := range tx.base.buckets {
 		nameSet[n] = struct{}{}
 	}
-	tx.db.bucketsMu.RUnlock()
 	for n := range tx.created {
 		nameSet[n] = struct{}{}
 	}
@@ -142,11 +116,7 @@ func (tx *Tx) Cursor() *Cursor {
 	return &Cursor{dir: dir, dirIdx: -1}
 }
 
-// Bucket retrieves a top-level bucket by name, opening a tx-local context for
-// it. For a read Tx the bucket's current generation is pinned (per-bucket
-// snapshot isolation); for a write Tx a dirty set is initialized and the
-// bucket's allocator state is snapshotted for rollback. Returns nil if the
-// bucket does not exist.
+// Bucket retrieves a top-level bucket by name, opening a tx-local context for it.
 func (tx *Tx) Bucket(name []byte) *Bucket {
 	if tx.db == nil {
 		return nil
@@ -158,36 +128,63 @@ func (tx *Tx) Bucket(name []byte) *Bucket {
 	if _, ok := tx.deleted[key]; ok {
 		return nil
 	}
-	if h := tx.created[key]; h != nil {
-		b := newBucketForHandle(tx, key, h)
-		tx.putBctx(key, b)
-		return b
-	}
-	tx.db.bucketsMu.RLock()
-	h := tx.db.buckets[key]
-	tx.db.bucketsMu.RUnlock()
-	if h == nil {
+	st := tx.base.buckets[key]
+	if st == nil {
 		return nil
 	}
-	b := newBucketForHandle(tx, key, h)
+	b := newBucket(tx, key, st)
 	tx.putBctx(key, b)
 	return b
 }
 
-// CreateBucket creates a new top-level bucket and returns a tx-local handle to
-// it. The bucket is usable immediately within this tx; it is registered in the
-// DB directory at commit.
+// CreateBucket creates a new top-level bucket and returns a tx-local handle to it.
 func (tx *Tx) CreateBucket(name []byte) (*Bucket, error) {
-	return tx.CreateBucketWithOptions(name, nil)
+	if tx.db == nil {
+		return nil, berrors.ErrTxClosed
+	}
+	if !tx.writable {
+		return nil, berrors.ErrTxNotWritable
+	}
+	if len(name) == 0 {
+		return nil, berrors.ErrBucketNameRequired
+	}
+
+	key := string(name)
+	if _, deleted := tx.deleted[key]; !deleted {
+		if _, created := tx.created[key]; created || tx.bucketExistsCommitted(key) {
+			return nil, berrors.ErrBucketExists
+		}
+	}
+
+	b := newBucket(tx, key, nil)
+	b.rootNode = &workNode{bucket: b, isLeaf: true}
+	if tx.created == nil {
+		tx.created = make(map[string]struct{})
+	}
+	tx.created[key] = struct{}{}
+	delete(tx.deleted, key)
+	tx.putBctx(key, b)
+	return b, nil
 }
 
 // CreateBucketIfNotExists creates a new bucket if it doesn't already exist.
 func (tx *Tx) CreateBucketIfNotExists(name []byte) (*Bucket, error) {
-	return tx.CreateBucketIfNotExistsWithOptions(name, nil)
+	if tx.db == nil {
+		return nil, berrors.ErrTxClosed
+	}
+	if !tx.writable {
+		return nil, berrors.ErrTxNotWritable
+	}
+	if len(name) == 0 {
+		return nil, berrors.ErrBucketNameRequired
+	}
+	if b := tx.Bucket(name); b != nil {
+		return b, nil
+	}
+	return tx.CreateBucket(name)
 }
 
-// DeleteBucket deletes a top-level bucket. The whole tree is discarded at
-// commit; no per-node freeing is needed.
+// DeleteBucket deletes a top-level bucket.
 func (tx *Tx) DeleteBucket(name []byte) error {
 	if tx.db == nil {
 		return berrors.ErrTxClosed
@@ -196,8 +193,7 @@ func (tx *Tx) DeleteBucket(name []byte) error {
 		return berrors.ErrTxNotWritable
 	}
 	key := string(name)
-	if tx.created[key] != nil {
-		// Created and deleted in the same tx: cancel the creation.
+	if _, ok := tx.created[key]; ok {
 		delete(tx.created, key)
 		delete(tx.bctx, key)
 		return nil
@@ -213,35 +209,28 @@ func (tx *Tx) DeleteBucket(name []byte) error {
 	return nil
 }
 
-// MoveBucket is not supported in the flat per-bucket model: buckets are all
-// top-level and indexed directly by name.
-func (tx *Tx) MoveBucket(child []byte, src *Bucket, dst *Bucket) error {
-	_ = child
-	_ = src
-	_ = dst
-	return berrors.ErrNestedBucketsUnsupported
-}
-
 // ForEach executes a function for each top-level bucket.
 func (tx *Tx) ForEach(fn func(name []byte, b *Bucket) error) error {
 	if tx.db == nil {
 		return berrors.ErrTxClosed
 	}
-	tx.db.bucketsMu.RLock()
-	names := make([]string, 0, len(tx.db.buckets))
-	for n := range tx.db.buckets {
-		names = append(names, n)
-	}
-	tx.db.bucketsMu.RUnlock()
-	for _, n := range names {
-		if _, ok := tx.deleted[n]; ok {
+	names := make([]string, 0, len(tx.base.buckets)+len(tx.created))
+	for n := range tx.base.buckets {
+		if _, deleted := tx.deleted[n]; deleted {
 			continue
 		}
-		if err := fn([]byte(n), tx.Bucket([]byte(n))); err != nil {
-			return err
-		}
+		names = append(names, n)
 	}
 	for n := range tx.created {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	seen := map[string]struct{}{}
+	for _, n := range names {
+		if _, ok := seen[n]; ok {
+			continue
+		}
+		seen[n] = struct{}{}
 		if err := fn([]byte(n), tx.Bucket([]byte(n))); err != nil {
 			return err
 		}
@@ -254,12 +243,9 @@ func (tx *Tx) OnCommit(fn func()) {
 	tx.commitHandlers = append(tx.commitHandlers, fn)
 }
 
-// bucketExistsCommitted reports whether a bucket name exists in the DB
-// directory (ignoring this tx's pending create/delete).
+// bucketExistsCommitted reports whether a bucket name exists in the transaction base state.
 func (tx *Tx) bucketExistsCommitted(key string) bool {
-	tx.db.bucketsMu.RLock()
-	_, ok := tx.db.buckets[key]
-	tx.db.bucketsMu.RUnlock()
+	_, ok := tx.base.buckets[key]
 	return ok
 }
 
@@ -270,29 +256,34 @@ func (tx *Tx) putBctx(key string, b *Bucket) {
 	tx.bctx[key] = b
 }
 
-// Commit publishes each touched bucket. Independent buckets are published one
-// atomic Store each (per-bucket snapshot isolation). Buckets that share a
-// commit group are published together via one group-snapshot Store, so
-// grouped buckets become visible atomically — no reader can see one member at a
-// newer generation than another.
-//
-// Pipeline:
-//  1. rebalance + spill (finalize) every touched bucket, assigning node ids;
-//  2. build each bucket's new immutable bucketState;
-//  3. publish under bucketsMu: independent buckets per-handle, dirty commit groups as
-//     rebuilt joint snapshots, plus pending create/delete.
-//
-// Steps 1-2 perform no publication, so a failure leaves nothing published and
-// the tx rolls back cleanly.
+func (tx *Tx) allocateNid() common.Nid {
+	if n := len(tx.freeNids); n > 0 {
+		id := tx.freeNids[n-1]
+		tx.freeNids = tx.freeNids[:n-1]
+		return id
+	}
+	id := common.Nid(tx.nextNid)
+	tx.nextNid++
+	return id
+}
+
+func (tx *Tx) freeNid(id common.Nid) {
+	if id == 0 {
+		return
+	}
+	tx.freeNids = append(tx.freeNids, id)
+}
+
+// Commit publishes one new globally consistent state.
 func (tx *Tx) Commit() (err error) {
 	lg := tx.db.Logger()
 	if lg != discardLogger {
-		lg.Debugf("Committing transaction ")
+		lg.Debugf("Committing transaction %d", tx.id)
 		defer func() {
 			if err != nil {
 				lg.Errorf("Committing transaction failed: %v", err)
 			} else {
-				lg.Debugf("Committing transaction successfully")
+				lg.Debugf("Committing transaction %d successfully", tx.id)
 			}
 		}()
 	}
@@ -305,7 +296,6 @@ func (tx *Tx) Commit() (err error) {
 		return berrors.ErrTxNotWritable
 	}
 
-	// Step 1: rebalance then spill each touched bucket.
 	startTime := time.Now()
 	for _, b := range tx.bctx {
 		b.rebalance()
@@ -324,82 +314,28 @@ func (tx *Tx) Commit() (err error) {
 	}
 	tx.stats.IncSpillTime(time.Since(startTime))
 
-	// Step 2: build the new published state for each touched bucket.
-	type pending struct {
-		handle *bucketHandle
-		state  *bucketState
-		isNew  bool
+	newBuckets := make(map[string]*bucketState, len(tx.base.buckets)+len(tx.created))
+	for name, st := range tx.base.buckets {
+		newBuckets[name] = st
 	}
-	pendings := make([]pending, 0, len(tx.bctx))
-	for _, b := range tx.bctx {
-		_, isNew := tx.created[b.name]
-		pendings = append(pendings, pending{
-			handle: b.handle,
-			state:  b.buildPublishedState(),
-			isNew:  isNew,
-		})
-	}
-
-	// Step 3: publish under the directory lock.
-	//   - touched INDEPENDENT buckets: per-handle atomic Store;
-	//   - each dirty commit group: rebuild its jointly-published snapshot (members
-	//     at their new state if touched this tx, else carried forward) and
-	//     Store it once, so all members become visible atomically together.
-	newStates := make(map[string]*bucketState, len(pendings))
-	for _, p := range pendings {
-		newStates[p.handle.name] = p.state
-	}
-	// Any touched grouped bucket must trigger its group's joint republish.
-	for _, p := range pendings {
-		if p.handle.commitGroup != nil {
-			tx.markCommitGroupDirty(p.handle.commitGroup)
-		}
-	}
-
-	tx.db.bucketsMu.Lock()
-	// 3a. register created buckets.
-	for _, p := range pendings {
-		if p.isNew {
-			tx.db.buckets[p.handle.name] = p.handle
-		}
-	}
-	// 3b. apply deletes; mark any commit group dirty so its snapshot drops the member.
 	for name := range tx.deleted {
-		if h := tx.db.buckets[name]; h != nil {
-			if h.commitGroup != nil {
-				tx.markCommitGroupDirty(h.commitGroup)
-			}
-			delete(tx.db.buckets, name)
-			tx.db.freeBucketId(h.id)
-		}
+		delete(newBuckets, name)
 	}
-	// 3c. publish independent touched buckets.
-	for _, p := range pendings {
-		if p.handle.commitGroup == nil {
-			p.handle.state.Store(p.state)
+	for name, b := range tx.bctx {
+		if _, deleted := tx.deleted[name]; deleted {
+			continue
 		}
+		newBuckets[name] = b.buildPublishedState()
 	}
-	// 3d. publish dirty commit groups: rebuild each from its current members.
-	for g := range tx.dirtyCommitGroups {
-		members := make(map[string]*bucketState)
-		for name, h := range tx.db.buckets {
-			if h.commitGroup != g {
-				continue
-			}
-			if st := newStates[name]; st != nil {
-				members[name] = st
-			} else {
-				members[name] = publishedStateOf(h) // carry untouched member forward
-			}
-		}
-		g.state.Store(&commitGroupSnapshot{members: members})
-	}
-	tx.db.bucketsMu.Unlock()
 
-	// Finalize the transaction.
+	tx.db.state.Store(&dbState{
+		buckets: newBuckets,
+		nextNid: tx.nextNid,
+		freeNid: append([]common.Nid(nil), tx.freeNids...),
+	})
+
 	tx.close()
 
-	// Execute commit handlers now that the locks have been removed.
 	for _, fn := range tx.commitHandlers {
 		fn()
 	}
@@ -417,29 +353,9 @@ func (tx *Tx) Rollback() error {
 	return nil
 }
 
-// rollback rolls back the transaction (internal, panic/commit-failure/user
-// Rollback path). It restores writer-private allocator state so ids allocated
-// during this tx are discarded, reclaims BucketIds for created-then-rolled-back
-// buckets, and then closes.
 func (tx *Tx) rollback() {
 	if tx.db == nil {
 		return
-	}
-	// Only a writable tx mutates (and therefore needs to restore) the
-	// writer-private allocator state. Read txs never snapshot it, so restoring
-	// on their (mandatory) rollback would clobber the live counters with zeros.
-	if tx.writable {
-		for _, b := range tx.bctx {
-			if b.handle == nil {
-				continue
-			}
-			b.handle.nextNodeId = b.snapNextNode
-			b.handle.freeNodeIds = b.snapFreeIds
-		}
-		// Reclaim BucketIds for buckets created then rolled back (never published).
-		for _, h := range tx.created {
-			tx.db.freeBucketId(h.id)
-		}
 	}
 	tx.close()
 }
@@ -451,22 +367,14 @@ func (tx *Tx) close() {
 	if tx.writable {
 		tx.db.rwtx = nil
 
-		// Return transaction-local workNode shells to the pool. On commit their
-		// inodes were already transferred to snapNodes by freeze(), so only the
-		// shells are recycled.
 		for _, b := range tx.bctx {
 			for _, n := range b.dirty {
 				releaseWorkNode(n)
 			}
 		}
 
-		// Merge statistics.
 		if tx.db.stats != nil {
 			tx.db.statlock.Lock()
-			tx.db.stats.FreePageN = 0
-			tx.db.stats.PendingPageN = 0
-			tx.db.stats.FreeAlloc = 0
-			tx.db.stats.FreelistInuse = 0
 			tx.db.stats.TxStats.add(&tx.stats)
 			tx.db.statlock.Unlock()
 		}
@@ -476,13 +384,12 @@ func (tx *Tx) close() {
 		tx.db.removeTx(tx)
 	}
 
-	// Clear all references.
 	tx.db = nil
+	tx.base = nil
 	tx.bctx = nil
 	tx.created = nil
 	tx.deleted = nil
-	tx.commitGroupSnaps = nil
-	tx.dirtyCommitGroups = nil
+	tx.freeNids = nil
 }
 
 // Copy writes the entire database to a writer as a BMSP snapshot (see snapshot.go).
@@ -491,9 +398,7 @@ func (tx *Tx) Copy(w errorWriter) error {
 	return err
 }
 
-// WriteTo writes the entire database to a writer as a BMSP snapshot. It traverses
-// top-level buckets in sorted name order (via Tx.Cursor) and, within each, keys
-// in sorted order, so the output is deterministic and round-trips with Restore.
+// WriteTo writes the entire database to a writer as a BMSP snapshot.
 func (tx *Tx) WriteTo(w errorWriter) (n int64, err error) {
 	return tx.serializeSnapshot(w)
 }
@@ -515,7 +420,6 @@ type errorWriter interface {
 
 // TxStats represents statistics about the actions performed by the transaction.
 type TxStats struct {
-	PageCount     int64
 	CursorCount   int64
 	NodeCount     int64
 	NodeDeref     int64
@@ -529,7 +433,6 @@ type TxStats struct {
 }
 
 func (s *TxStats) add(other *TxStats) {
-	s.IncPageCount(other.GetPageCount())
 	s.IncCursorCount(other.GetCursorCount())
 	s.IncNodeCount(other.GetNodeCount())
 	s.IncNodeDeref(other.GetNodeDeref())
@@ -545,7 +448,6 @@ func (s *TxStats) add(other *TxStats) {
 // Sub calculates and returns the difference between two sets of transaction stats.
 func (s *TxStats) Sub(other *TxStats) TxStats {
 	var diff TxStats
-	diff.PageCount = s.GetPageCount() - other.GetPageCount()
 	diff.CursorCount = s.GetCursorCount() - other.GetCursorCount()
 	diff.NodeCount = s.GetNodeCount() - other.GetNodeCount()
 	diff.NodeDeref = s.GetNodeDeref() - other.GetNodeDeref()
@@ -557,14 +459,6 @@ func (s *TxStats) Sub(other *TxStats) TxStats {
 	diff.Write = s.GetWrite() - other.GetWrite()
 	diff.WriteTime = s.GetWriteTime() - other.GetWriteTime()
 	return diff
-}
-
-func (s *TxStats) GetPageCount() int64 {
-	return atomic.LoadInt64(&s.PageCount)
-}
-
-func (s *TxStats) IncPageCount(delta int64) int64 {
-	return atomic.AddInt64(&s.PageCount, delta)
 }
 
 func (s *TxStats) GetCursorCount() int64 {

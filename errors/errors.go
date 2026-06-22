@@ -77,16 +77,9 @@ var (
 	// non-bucket key on an existing bucket key.
 	ErrIncompatibleValue = errors.New("incompatible value")
 
-	// ErrSameBuckets is returned when trying to move a sub-bucket between
-	// source and target buckets, while source and target buckets are the same.
+	// ErrSameBuckets is retained for API compatibility.
 	ErrSameBuckets = errors.New("the source and target are the same bucket")
 
-	// ErrDifferentDB is returned when trying to move a sub-bucket between
-	// source and target buckets, while source and target buckets are in different database files.
+	// ErrDifferentDB is retained for API compatibility.
 	ErrDifferentDB = errors.New("the source and target buckets are in different database files")
-
-	// ErrNestedBucketsUnsupported is returned when the pure memory engine is
-	// asked to create, delete, or move nested buckets. The node-centric memory
-	// design only supports independent top-level buckets.
-	ErrNestedBucketsUnsupported = errors.New("nested buckets are not supported in pure memory mode")
 )

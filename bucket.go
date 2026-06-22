@@ -24,55 +24,34 @@ const (
 // DefaultFillPercent is the percentage that split nodes are filled.
 const DefaultFillPercent = 0.5
 
-// Bucket is a tx-local handle to one top-level B+tree. Each top-level bucket is
-// an independent tree published atomically via its bucketHandle. A Bucket is
-// never shared across transactions.
+// Bucket is a tx-local handle to one top-level B+tree. A Bucket is never shared
+// across transactions.
 type Bucket struct {
-	tx     *Tx
-	name   string
-	handle *bucketHandle
+	tx   *Tx
+	name string
 
 	base     *bucketState             // pinned generation: read view / COW base (nil for a brand-new bucket)
 	rootNode *workNode                // materialized mutable root (nil until first write)
 	dirty    map[common.Nid]*workNode // tx-local mutable node cache (write tx only)
 	obsolete map[common.Nid]struct{}  // node ids freed in this tx (write tx only)
 
-	// Rollback snapshot of the handle's writer-private allocator state.
-	snapNextNode uint64
-	snapFreeIds  []uint64
-
 	// FillPercent sets the threshold for filling nodes when they split. It is
 	// non-persisted and must be set per tx.
 	FillPercent float64
 }
 
-// newBucketForHandle creates a tx-local Bucket bound to an existing (committed
-// or tx-created) bucketHandle. It pins the handle's current generation as the
-// read view / COW base; for a write tx it also initializes the dirty set and
-// snapshots the allocator state for rollback.
-func newBucketForHandle(tx *Tx, name string, h *bucketHandle) *Bucket {
+// newBucket creates a tx-local Bucket bound to an existing committed bucket
+// state or a brand-new bucket when base is nil.
+func newBucket(tx *Tx, name string, base *bucketState) *Bucket {
 	b := &Bucket{
 		tx:          tx,
 		name:        name,
-		handle:      h,
+		base:        base,
 		FillPercent: DefaultFillPercent,
 	}
-	// Resolve the pinned generation (read view / COW base). For a grouped bucket
-	// the state lives in the group's jointly-published snapshot (pinned per tx);
-	// for an independent bucket it lives in the handle's own atomic pointer.
-	if h.commitGroup != nil {
-		if snap := tx.pinCommitGroup(h.commitGroup); snap != nil {
-			b.base = snap.members[name]
-		}
-	} else {
-		b.base = h.state.Load()
-	}
-
 	if tx.writable {
 		b.dirty = make(map[common.Nid]*workNode)
 		b.obsolete = make(map[common.Nid]struct{})
-		b.snapNextNode = h.nextNodeId
-		b.snapFreeIds = append([]uint64(nil), h.freeNodeIds...)
 	}
 	return b
 }
@@ -176,54 +155,6 @@ func (b *Bucket) ForEach(fn func(k, v []byte) error) error {
 		}
 	}
 	return nil
-}
-
-// ForEachBucket iterates child buckets. The flat per-bucket model has no
-// nested buckets, so this is a no-op.
-func (b *Bucket) ForEachBucket(fn func(k []byte) error) error {
-	if b.tx.db == nil {
-		return errors.ErrTxClosed
-	}
-	_ = fn
-	return nil
-}
-
-// The following methods are the legacy nested-bucket API. The flat per-bucket
-// model only supports top-level buckets (created/looked up via Tx), so these
-// are retained as compile-compatible stubs that report the bucket as absent or
-// unsupported. This keeps the vmbolt CLI (bench/compact/etc.) building; its
-// nested-bucket scenarios behave exactly as they did before this refactor
-// (they already returned ErrNestedBucketsUnsupported).
-
-// Bucket retrieves a nested bucket by name. Always nil: nesting is unsupported.
-func (b *Bucket) Bucket(name []byte) *Bucket {
-	_ = name
-	return nil
-}
-
-// CreateBucket creates a nested bucket. Unsupported in the flat model.
-func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
-	_ = key
-	return nil, errors.ErrNestedBucketsUnsupported
-}
-
-// CreateBucketIfNotExists creates a nested bucket. Unsupported in the flat model.
-func (b *Bucket) CreateBucketIfNotExists(key []byte) (*Bucket, error) {
-	_ = key
-	return nil, errors.ErrNestedBucketsUnsupported
-}
-
-// DeleteBucket deletes a nested bucket. Unsupported in the flat model.
-func (b *Bucket) DeleteBucket(key []byte) error {
-	_ = key
-	return errors.ErrNestedBucketsUnsupported
-}
-
-// MoveBucket moves a nested bucket. Unsupported in the flat model.
-func (b *Bucket) MoveBucket(key []byte, dst *Bucket) error {
-	_ = key
-	_ = dst
-	return errors.ErrNestedBucketsUnsupported
 }
 
 // Inspect returns the structure of the bucket.
@@ -378,9 +309,7 @@ func (b *Bucket) pageNode(id common.Nid) *node {
 
 // allocate returns a new node id for this bucket, reusing freed ids first.
 func (b *Bucket) allocate() (common.Nid, error) {
-	nid := b.handle.allocNode()
-	b.tx.stats.IncPageCount(1)
-	return nid, nil
+	return b.tx.allocateNid(), nil
 }
 
 // spill finalizes the bucket's dirty tree (split + assign node ids).
@@ -402,8 +331,7 @@ func (b *Bucket) rebalance() {
 	}
 }
 
-// markObsolete records that a node id is freed in this tx and recycles its
-// bucket-local NodeId for reuse. Idempotent.
+// markObsolete records that a node id is freed in this tx. Idempotent.
 func (b *Bucket) markObsolete(id common.Nid) {
 	if b.obsolete == nil {
 		return
@@ -412,9 +340,7 @@ func (b *Bucket) markObsolete(id common.Nid) {
 		return
 	}
 	b.obsolete[id] = struct{}{}
-	if b.handle != nil && id != 0 {
-		b.handle.freeNode(id.NodeId())
-	}
+	b.tx.freeNid(id)
 }
 
 // dropNode removes a node from the tx-local dirty cache and marks it obsolete.
@@ -455,7 +381,6 @@ func (b *Bucket) buildPublishedState() *bucketState {
 	}
 
 	return &bucketState{
-		id:    b.handle.id,
 		root:  rootNid,
 		nodes: newNodes,
 	}

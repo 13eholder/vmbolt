@@ -684,9 +684,6 @@ func TestTx_Rollback(t *testing.T) {
 func TestTxStats_GetAndIncAtomically(t *testing.T) {
 	var stats bolt.TxStats
 
-	stats.IncPageCount(1)
-	assert.Equal(t, int64(1), stats.GetPageCount())
-
 	stats.IncCursorCount(3)
 	assert.Equal(t, int64(3), stats.GetCursorCount())
 
@@ -719,7 +716,6 @@ func TestTxStats_GetAndIncAtomically(t *testing.T) {
 
 	assert.Equal(t,
 		bolt.TxStats{
-			PageCount:     1,
 			CursorCount:   3,
 			NodeCount:     100,
 			NodeDeref:     101,
@@ -737,7 +733,6 @@ func TestTxStats_GetAndIncAtomically(t *testing.T) {
 
 func TestTxStats_Sub(t *testing.T) {
 	statsA := bolt.TxStats{
-		PageCount:     1,
 		CursorCount:   3,
 		NodeCount:     100,
 		NodeDeref:     101,
@@ -751,7 +746,6 @@ func TestTxStats_Sub(t *testing.T) {
 	}
 
 	statsB := bolt.TxStats{
-		PageCount:     2,
 		CursorCount:   4,
 		NodeCount:     101,
 		NodeDeref:     102,
@@ -765,7 +759,6 @@ func TestTxStats_Sub(t *testing.T) {
 	}
 
 	diff := statsB.Sub(&statsA)
-	assert.Equal(t, int64(1), diff.GetPageCount())
 	assert.Equal(t, int64(1), diff.GetCursorCount())
 	assert.Equal(t, int64(1), diff.GetNodeCount())
 	assert.Equal(t, int64(1), diff.GetNodeDeref())

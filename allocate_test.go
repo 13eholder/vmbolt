@@ -1,36 +1,34 @@
 package vmbolt
 
-import (
-	"testing"
+import "testing"
 
-	"13eholder/vmbolt/internal/common"
-)
+func TestTx_AllocFreeRecycleNid(t *testing.T) {
+	db := mustOpenMem(t)
+	defer func() { _ = db.Close() }()
 
-// TestBucketHandle_AllocFreeRecycle exercises the per-bucket node-id allocator:
-// ids carry the bucket's prefix, freed ids are reused (LIFO), and the monotonic
-// counter only advances when the freelist is empty.
-func TestBucketHandle_AllocFreeRecycle(t *testing.T) {
-	h := &bucketHandle{id: common.BucketId(7)}
-
-	n0 := h.allocNode()
-	n1 := h.allocNode()
-	if n0.NodeId() != 0 || n1.NodeId() != 1 {
-		t.Fatalf("expected node ids 0,1; got %d,%d", n0.NodeId(), n1.NodeId())
-	}
-	if n0.BucketOf() != 7 || n1.BucketOf() != 7 {
-		t.Fatalf("nid bucket prefix wrong: %d,%d", n0.BucketOf(), n1.BucketOf())
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatalf("begin write tx: %v", err)
 	}
 
-	// Free node 0, then allocate: the freed id must come back (LIFO).
-	h.freeNode(0)
-	n2 := h.allocNode()
-	if n2.NodeId() != 0 {
-		t.Fatalf("expected recycled node id 0; got %d", n2.NodeId())
+	n0 := tx.allocateNid()
+	n1 := tx.allocateNid()
+	if n0 != 1 || n1 != 2 {
+		t.Fatalf("expected node ids 1,2; got %d,%d", n0, n1)
 	}
 
-	// Freelist empty again: next alloc advances the counter (2, not reused).
-	n3 := h.allocNode()
-	if n3.NodeId() != 2 {
-		t.Fatalf("expected fresh node id 2; got %d", n3.NodeId())
+	tx.freeNid(n0)
+	n2 := tx.allocateNid()
+	if n2 != n0 {
+		t.Fatalf("expected recycled node id %d; got %d", n0, n2)
+	}
+
+	n3 := tx.allocateNid()
+	if n3 != 3 {
+		t.Fatalf("expected fresh node id 3; got %d", n3)
+	}
+
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback: %v", err)
 	}
 }

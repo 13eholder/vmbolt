@@ -39,15 +39,9 @@ type DB struct {
 	rwtx   *Tx
 	stats  *Stats
 
-	// Per-bucket directory: name -> bucketHandle. Reads look it up under
-	// bucketsMu.RLock; create/delete mutate it under the write side (which the
-	// single in-flight writer already holds via rwlock). Each handle owns an
-	// atomic.Pointer[bucketState] for lock-free, per-bucket publish.
-	bucketsMu     sync.RWMutex
-	buckets       map[string]*bucketHandle
-	txid          atomic.Uint64 // global monotonic transaction counter (Tx.ID)
-	nextBucketId  uint16        // writer-private 16-bit BucketId allocator (starts at 1)
-	freeBucketIds []uint16      // LIFO of recycled BucketIds
+	// state is the single publication point for the whole database view.
+	state atomic.Pointer[dbState]
+	txid  atomic.Uint64
 
 	batchMu sync.Mutex
 	batch   *batch
@@ -161,14 +155,13 @@ func (db *DB) maybeRestore(path string) error {
 	return nil
 }
 
-// init creates the empty per-bucket directory. Pure memory mode starts with
-// no buckets and no reserved node ids; buckets (and their BucketIds) are
-// allocated on demand via CreateBucket.
+// init creates the empty database state. Pure memory mode starts with no
+// buckets and no allocated node ids. Nid 0 remains reserved.
 func (db *DB) init() error {
-	db.buckets = make(map[string]*bucketHandle)
-	// BucketId 0 is reserved: Nid 0 is the "unassigned" sentinel, so a bucket
-	// whose id was 0 would alias it. Start allocation at 1.
-	db.nextBucketId = 1
+	db.state.Store(&dbState{
+		buckets: map[string]*bucketState{},
+		nextNid: 1,
+	})
 	return nil
 }
 
@@ -186,7 +179,7 @@ func (db *DB) close() error {
 	}
 
 	db.opened = false
-	db.buckets = nil
+	db.state.Store(nil)
 	db.path = ""
 
 	return nil
@@ -219,16 +212,20 @@ func (db *DB) Logger() Logger {
 }
 
 func (db *DB) beginTx() (*Tx, error) {
-	// Exit if the database is not open yet.
 	if !db.opened {
 		return nil, berrors.ErrDatabaseNotOpen
 	}
+	base := db.state.Load()
+	if base == nil {
+		return nil, berrors.ErrDatabaseNotOpen
+	}
 
-	// Read transactions lazily pin each touched bucket's current generation on
-	// first access (per-bucket snapshot isolation). There is no global snapshot.
-	t := &Tx{db: db}
+	t := &Tx{
+		db:   db,
+		base: base,
+		id:   db.txid.Add(1),
+	}
 
-	// Update the transaction stats.
 	if db.stats != nil {
 		db.statlock.Lock()
 		db.stats.TxN++
@@ -240,31 +237,37 @@ func (db *DB) beginTx() (*Tx, error) {
 }
 
 func (db *DB) beginRWTx() (*Tx, error) {
-	// If the database was opened with Options.ReadOnly, return an error.
 	if db.readOnly {
 		return nil, berrors.ErrDatabaseReadOnly
 	}
 
-	// Obtain writer lock. This is released by the transaction when it closes.
-	// A single global writer serializes all updates; buckets are published
-	// independently at commit time.
 	db.rwlock.Lock()
 
-	// Exit if the database is not open yet.
 	if !db.opened {
 		db.rwlock.Unlock()
 		return nil, berrors.ErrDatabaseNotOpen
 	}
 
-	// Create a transaction associated with the database.
-	t := &Tx{db: db, writable: true}
+	base := db.state.Load()
+	if base == nil {
+		db.rwlock.Unlock()
+		return nil, berrors.ErrDatabaseNotOpen
+	}
+
+	t := &Tx{
+		db:       db,
+		writable: true,
+		base:     base,
+		id:       db.txid.Add(1),
+		nextNid:  base.nextNid,
+		freeNids: append([]common.Nid(nil), base.freeNid...),
+	}
 	db.rwtx = t
 	return t, nil
 }
 
 // removeTx removes a transaction from the database.
 func (db *DB) removeTx(tx *Tx) {
-	// Merge statistics.
 	if db.stats != nil {
 		db.statlock.Lock()
 		db.stats.OpenTxN--
@@ -280,17 +283,13 @@ func (db *DB) Update(fn func(*Tx) error) error {
 		return err
 	}
 
-	// Make sure the transaction rolls back in the event of a panic.
 	defer func() {
 		if t.db != nil {
 			t.rollback()
 		}
 	}()
 
-	// Mark as a managed tx so that the inner function cannot manually commit.
 	t.managed = true
-
-	// If an error is returned from the function then rollback and return error.
 	err = fn(t)
 	t.managed = false
 	if err != nil {
@@ -308,17 +307,13 @@ func (db *DB) View(fn func(*Tx) error) error {
 		return err
 	}
 
-	// Make sure the transaction rolls back in the event of a panic.
 	defer func() {
 		if t.db != nil {
 			t.rollback()
 		}
 	}()
 
-	// Mark as a managed tx so that the inner function cannot manually rollback.
 	t.managed = true
-
-	// If an error is returned from the function then pass it through.
 	err = fn(t)
 	t.managed = false
 	if err != nil {
@@ -337,15 +332,11 @@ func (db *DB) Batch(fn func(*Tx) error) error {
 
 	db.batchMu.Lock()
 	if (db.batch == nil) || (db.batch != nil && len(db.batch.calls) >= db.MaxBatchSize) {
-		// There is no existing batch, or the existing batch is full; start a new one.
-		db.batch = &batch{
-			db: db,
-		}
+		db.batch = &batch{db: db}
 		db.batch.timer = time.AfterFunc(db.MaxBatchDelay, db.batch.trigger)
 	}
 	db.batch.calls = append(db.batch.calls, call{fn: fn, err: errCh})
 	if len(db.batch.calls) >= db.MaxBatchSize {
-		// wake up batch, it's ready to run
 		go db.batch.trigger()
 	}
 	db.batchMu.Unlock()
@@ -379,8 +370,6 @@ func (b *batch) trigger() {
 func (b *batch) run() {
 	b.db.batchMu.Lock()
 	b.timer.Stop()
-	// Make sure no new work is added to this batch, but don't break
-	// other batches.
 	if b.db.batch == b {
 		b.db.batch = nil
 	}
@@ -400,17 +389,12 @@ retry:
 		})
 
 		if failIdx >= 0 {
-			// take the failing transaction out of the batch. it's
-			// safe to shorten b.calls here because db.batch no longer
-			// points to us, and we hold the mutex anyway.
 			c := b.calls[failIdx]
 			b.calls[failIdx], b.calls = b.calls[len(b.calls)-1], b.calls[:len(b.calls)-1]
-			// tell the submitter re-run it solo, continue with the rest of the batch
 			c.err <- trySolo
 			continue retry
 		}
 
-		// pass success, or bolt internal errors, to all callers
 		for _, c := range b.calls {
 			c.err <- err
 		}
@@ -418,9 +402,6 @@ retry:
 	}
 }
 
-// trySolo is a special sentinel error value used for signaling that a
-// transaction function should be re-run. It should never be seen by
-// callers.
 var trySolo = errors.New("batch function returned an error and should be re-run solo")
 
 type panicked struct {
@@ -459,29 +440,6 @@ func (db *DB) Info() *Info {
 	return &Info{0}
 }
 
-// allocBucketId returns a fresh 16-bit BucketId for a new bucket, reusing a
-// recycled id (LIFO) when available. Writer-private: only called under rwlock.
-func (db *DB) allocBucketId() common.BucketId {
-	if n := len(db.freeBucketIds); n > 0 {
-		id := db.freeBucketIds[n-1]
-		db.freeBucketIds = db.freeBucketIds[:n-1]
-		return common.BucketId(id)
-	}
-	id := db.nextBucketId
-	if id == 0 {
-		// nextBucketId wrapped past 65535 back to 0. BucketId 0 is reserved, and
-		// if the freelist is also empty the BucketId space (65535) is exhausted.
-		panic("vmbolt: BucketId space exhausted (max 65535 buckets)")
-	}
-	db.nextBucketId++
-	return common.BucketId(id)
-}
-
-// freeBucketId returns a BucketId to the pool for reuse. Writer-private.
-func (db *DB) freeBucketId(id common.BucketId) {
-	db.freeBucketIds = append(db.freeBucketIds, uint16(id))
-}
-
 func (db *DB) IsReadOnly() bool {
 	return db.readOnly
 }
@@ -514,12 +472,6 @@ type Stats struct {
 	// Put `TxStats` at the first field to ensure it's 64-bit aligned.
 	TxStats TxStats // global, ongoing stats.
 
-	// Freelist stats
-	FreePageN     int // total number of free pages on the freelist
-	PendingPageN  int // total number of pending pages on the freelist
-	FreeAlloc     int // total bytes allocated in free pages
-	FreelistInuse int // total bytes used by the freelist
-
 	// Transaction stats
 	TxN     int // total number of started read transactions
 	OpenTxN int // number of currently open read transactions
@@ -531,10 +483,6 @@ func (s *Stats) Sub(other *Stats) Stats {
 		return *s
 	}
 	var diff Stats
-	diff.FreePageN = s.FreePageN
-	diff.PendingPageN = s.PendingPageN
-	diff.FreeAlloc = s.FreeAlloc
-	diff.FreelistInuse = s.FreelistInuse
 	diff.TxN = s.TxN - other.TxN
 	diff.TxStats = s.TxStats.Sub(&other.TxStats)
 	return diff

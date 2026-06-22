@@ -14,7 +14,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	bolt "13eholder/vmbolt"
-	"13eholder/vmbolt/errors"
 	"13eholder/vmbolt/internal/btesting"
 )
 
@@ -168,7 +167,6 @@ func TestCursor_Bucket(t *testing.T) {
 
 // Ensure that a Tx cursor can seek to the appropriate keys.
 func TestCursor_Seek(t *testing.T) {
-	t.Skip("nested bucket cursor semantics are not applicable to pure memory top-level bucket model")
 	db := btesting.MustCreateDB(t)
 	if err := db.Update(func(tx *bolt.Tx) error {
 		b, err := tx.CreateBucket([]byte("widgets"))
@@ -184,10 +182,6 @@ func TestCursor_Seek(t *testing.T) {
 		if err := b.Put([]byte("baz"), []byte("0003")); err != nil {
 			t.Fatal(err)
 		}
-
-		if _, err := b.CreateBucket([]byte("bkt")); err != nil {
-			t.Fatal(err)
-		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -195,42 +189,18 @@ func TestCursor_Seek(t *testing.T) {
 
 	if err := db.View(func(tx *bolt.Tx) error {
 		c := tx.Bucket([]byte("widgets")).Cursor()
-
-		// Exact match should go to the key.
-		if k, v := c.Seek([]byte("bar")); !bytes.Equal(k, []byte("bar")) {
-			t.Fatalf("unexpected key: %v", k)
-		} else if !bytes.Equal(v, []byte("0002")) {
-			t.Fatalf("unexpected value: %v", v)
+		if k, v := c.Seek([]byte("bar")); !bytes.Equal(k, []byte("bar")) || !bytes.Equal(v, []byte("0002")) {
+			t.Fatalf("unexpected seek result: %q=%q", k, v)
 		}
-
-		// Inexact match should go to the next key.
-		if k, v := c.Seek([]byte("bas")); !bytes.Equal(k, []byte("baz")) {
-			t.Fatalf("unexpected key: %v", k)
-		} else if !bytes.Equal(v, []byte("0003")) {
-			t.Fatalf("unexpected value: %v", v)
+		if k, v := c.Seek([]byte("bas")); !bytes.Equal(k, []byte("baz")) || !bytes.Equal(v, []byte("0003")) {
+			t.Fatalf("unexpected seek result: %q=%q", k, v)
 		}
-
-		// Low key should go to the first key.
-		if k, v := c.Seek([]byte("")); !bytes.Equal(k, []byte("bar")) {
-			t.Fatalf("unexpected key: %v", k)
-		} else if !bytes.Equal(v, []byte("0002")) {
-			t.Fatalf("unexpected value: %v", v)
+		if k, v := c.Seek([]byte("")); !bytes.Equal(k, []byte("bar")) || !bytes.Equal(v, []byte("0002")) {
+			t.Fatalf("unexpected seek result: %q=%q", k, v)
 		}
-
-		// High key should return no key.
-		if k, v := c.Seek([]byte("zzz")); k != nil {
-			t.Fatalf("expected nil key: %v", k)
-		} else if v != nil {
-			t.Fatalf("expected nil value: %v", v)
+		if k, v := c.Seek([]byte("zzz")); k != nil || v != nil {
+			t.Fatalf("expected nil seek result, got %q=%q", k, v)
 		}
-
-		// Buckets should return their key but no value.
-		if k, v := c.Seek([]byte("bkt")); !bytes.Equal(k, []byte("bkt")) {
-			t.Fatalf("unexpected key: %v", k)
-		} else if v != nil {
-			t.Fatalf("expected nil value: %v", v)
-		}
-
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -238,7 +208,6 @@ func TestCursor_Seek(t *testing.T) {
 }
 
 func TestCursor_Delete(t *testing.T) {
-	t.Skip("nested bucket cursor semantics are not applicable to pure memory top-level bucket model")
 	db := btesting.MustCreateDB(t)
 
 	const count = 1000
@@ -256,9 +225,6 @@ func TestCursor_Delete(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if _, err := b.CreateBucket([]byte("sub")); err != nil {
-			t.Fatal(err)
-		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -274,11 +240,6 @@ func TestCursor_Delete(t *testing.T) {
 			}
 		}
 
-		c.Seek([]byte("sub"))
-		if err := c.Delete(); err != errors.ErrIncompatibleValue {
-			t.Fatalf("unexpected error: %s", err)
-		}
-
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -286,7 +247,7 @@ func TestCursor_Delete(t *testing.T) {
 
 	if err := db.View(func(tx *bolt.Tx) error {
 		stats := tx.Bucket([]byte("widgets")).Stats()
-		if stats.KeyN != count/2+1 {
+		if stats.KeyN != count/2 {
 			t.Fatalf("unexpected KeyN: %d", stats.KeyN)
 		}
 		return nil
@@ -795,89 +756,6 @@ func TestCursor_QuickCheck_Reverse(t *testing.T) {
 	}
 }
 
-// Ensure that a Tx cursor can iterate over subbuckets.
-func TestCursor_QuickCheck_BucketsOnly(t *testing.T) {
-	t.Skip("nested buckets are not supported in pure memory mode")
-	db := btesting.MustCreateDB(t)
-
-	if err := db.Update(func(tx *bolt.Tx) error {
-		b, err := tx.CreateBucket([]byte("widgets"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := b.CreateBucket([]byte("foo")); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := b.CreateBucket([]byte("bar")); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := b.CreateBucket([]byte("baz")); err != nil {
-			t.Fatal(err)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := db.View(func(tx *bolt.Tx) error {
-		var names []string
-		c := tx.Bucket([]byte("widgets")).Cursor()
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			names = append(names, string(k))
-			if v != nil {
-				t.Fatalf("unexpected value: %v", v)
-			}
-		}
-		if !reflect.DeepEqual(names, []string{"bar", "baz", "foo"}) {
-			t.Fatalf("unexpected names: %+v", names)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// Ensure that a Tx cursor can reverse iterate over subbuckets.
-func TestCursor_QuickCheck_BucketsOnly_Reverse(t *testing.T) {
-	t.Skip("nested buckets are not supported in pure memory mode")
-	db := btesting.MustCreateDB(t)
-
-	if err := db.Update(func(tx *bolt.Tx) error {
-		b, err := tx.CreateBucket([]byte("widgets"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := b.CreateBucket([]byte("foo")); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := b.CreateBucket([]byte("bar")); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := b.CreateBucket([]byte("baz")); err != nil {
-			t.Fatal(err)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := db.View(func(tx *bolt.Tx) error {
-		var names []string
-		c := tx.Bucket([]byte("widgets")).Cursor()
-		for k, v := c.Last(); k != nil; k, v = c.Prev() {
-			names = append(names, string(k))
-			if v != nil {
-				t.Fatalf("unexpected value: %v", v)
-			}
-		}
-		if !reflect.DeepEqual(names, []string{"foo", "baz", "bar"}) {
-			t.Fatalf("unexpected names: %+v", names)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-}
 
 func ExampleCursor() {
 	// Open the database.

@@ -1,10 +1,11 @@
 # vmbolt
 
-`vmbolt` is a **pure-memory**, **per-bucket** key/value store — a fork of
+`vmbolt` is a **pure-memory** key/value store — a fork of
 [bbolt][bbolt] rebuilt around an in-memory node graph instead of an mmap'd file.
 
 - **Module:** `13eholder/vmbolt` · **package:** `vmbolt`
-- Every top-level bucket is an **independent, atomically-published B+tree**.
+- Top-level buckets stay **flat** and keep their own B+tree structure, but the
+  database publishes **one globally consistent view per transaction commit**.
 - **No on-disk persistence** by default: the whole database lives in process
   memory. A snapshot can be written/read back on demand (BMSP format), but there
   is no per-commit `fsync`, no WAL, and no file lock.
@@ -26,12 +27,11 @@
 - [Install](#install)
 - [Quick start](#quick-start)
 - [The model](#the-model)
-  - [Per-bucket atomic trees](#per-bucket-atomic-trees)
-  - [Nid layout](#nid-layout)
+  - [Flat top-level buckets](#flat-top-level-buckets)
+  - [Global Nid allocator](#global-nid-allocator)
   - [Read snapshot isolation](#read-snapshot-isolation)
   - [Single writer](#single-writer)
 - [Snapshots & restore (BMSP)](#snapshots--restore-bmsp)
-- [Commit Groups: atomic bucket groups](#commit-groups-atomic-bucket-groups)
 - [API reference](#api-reference)
 - [Differences from bbolt](#differences-from-bbolt)
 - [Caveats & limitations](#caveats--limitations)
@@ -96,53 +96,44 @@ _ = db.View(func(tx *vmbolt.Tx) error {
 
 ## The model
 
-### Per-bucket atomic trees
+### Flat top-level buckets
 
-The database is a directory of named buckets:
+The database is a directory of named top-level buckets held inside one
+published database state:
 
 ```
-DB.buckets  map[string]*bucketHandle
-              └─ each handle owns atomic.Pointer[bucketState]
-                 bucketState{ root, nodes map[Nid]*snapNode }
+DB.state -> dbState{
+  buckets map[string]*bucketState
+  nextNid
+  freeNid
+}
 ```
 
-- Each top-level bucket is its own B+tree, published through its own atomic
-  pointer. A commit rebuilds and republishes **only the buckets it touched**;
-  untouched buckets are not churned.
+- Each top-level bucket remains its own B+tree.
+- A commit still rebuilds only the buckets it touched internally, but readers
+  observe them through one globally published `dbState`, so a transaction sees
+  one consistent database view across all buckets.
 - Writes use copy-on-write: a write transaction materializes mutable
   `workNode`s from the immutable `snapNode`s, mutates them, and on commit
-  *freezes* them back into new immutable `snapNode`s (zero-copy inode transfer)
-  and atomically swaps the bucket's published state.
-- Node ids are **recyclable**: a per-bucket LIFO freelist reuses ids freed by
-  deletes/rebalance, so long-lived churn does not run the id space up.
+  *freezes* them back into new immutable `snapNode`s (zero-copy inode transfer).
 
-### Nid layout
+### Global Nid allocator
 
-A node id is 64 bits:
-
-```
-[ BucketId (16 bits) ][ NodeId (48 bits) ]
-```
-
-- `BucketId` (high 16) makes every Nid globally unique and self-routing; it is
-  assigned when a bucket is created and recycled when the bucket is deleted
-  (max **65 535** concurrent buckets).
-- `NodeId` (low 48) is bucket-local and recycled via the per-bucket freelist.
+- `Nid` is a plain globally unique node id.
+- Nid allocation is database-wide, not bucket-scoped.
+- Freed node ids are recycled via a global LIFO freelist carried in `dbState`.
 
 ### Read snapshot isolation
 
-A read transaction pins each bucket's current generation **lazily, on first
-access**, and holds that pinned generation for the transaction's lifetime.
-Within a single bucket, reads are consistent. Across buckets, a read
-transaction may observe different buckets at different generations — this is
-intentional and is the price of independent per-bucket publish.
+A read transaction pins the current `dbState` at `Begin` time and holds that
+global view for the transaction's lifetime. Reads are therefore consistent both
+within a bucket and across buckets.
 
 ### Single writer
 
-There is one global write lock (`db.Update`/`Begin(true)`). Reads are
-lock-free (they dereference atomic pointers). Commit is **build-all-then-
-publish-all**: every touched bucket's new state is constructed first, then
-published, so a failed commit publishes nothing.
+There is one global write lock (`db.Update`/`Begin(true)`). Commit is
+**build-all-then-publish**: touched buckets are rebuilt first, then one new
+`dbState` is atomically published, so a failed commit publishes nothing.
 
 ---
 
@@ -170,29 +161,6 @@ background persistence. Between snapshots, data is volatile.
 
 ---
 
-## Commit Groups: atomic bucket groups
-
-By default buckets are published independently, so there is **no cross-bucket
-atomicity**. Some workloads (notably etcd's `consistent_index` vs its MVCC
-`key` tree) need a small set of buckets to be observed **jointly**. vmbolt
-provides a *commit group* for exactly that:
-
-```go
-ag := db.NewCommitGroup()
-_ = db.Update(func(tx *vmbolt.Tx) error {
-	if _, err := tx.CreateBucketWithOptions([]byte("meta"), &vmbolt.BucketOptions{CommitGroup: ag}); err != nil { return err }
-	_, err := tx.CreateBucketWithOptions([]byte("key"), &vmbolt.BucketOptions{CommitGroup: ag})
-	return err
-})
-```
-
-Members of a commit group share one atomic publication point: a reader loading the
-group snapshot sees **all members at one consistent generation**. Non-member
-buckets keep being published independently, so the cost is paid only by the
-buckets that actually need joint consistency.
-
----
-
 ## API reference
 
 Database:
@@ -203,7 +171,6 @@ Database:
 | `Close()` | Release resources |
 | `Update(fn)` / `View(fn)` / `Batch(fn)` | Managed read-write / read-only / batched tx |
 | `Begin(writable)` | Manual transaction (remember to `Commit`/`Rollback`) |
-| `NewCommitGroup()` | Create an atomic bucket group |
 | `Restore(r)` | Rehydrate from a BMSP reader |
 | `Stats()`, `Info()`, `Path()`, `Logger()` | Diagnostics |
 
@@ -212,7 +179,7 @@ Transaction:
 | Method | Notes |
 |--------|-------|
 | `Bucket(name)` | Open a top-level bucket (nil if absent) |
-| `CreateBucket` / `CreateBucketIfNotExists` / `CreateBucketWithOptions` / `CreateBucketIfNotExistsWithOptions` / `DeleteBucket` | Bucket lifecycle |
+| `CreateBucket` / `CreateBucketIfNotExists` / `DeleteBucket` | Bucket lifecycle |
 | `ForEach(fn)` | Iterate top-level buckets (**unordered** — map iteration) |
 | `Cursor()` | Sorted cursor over top-level **bucket names** (deterministic) |
 | `Size()` | Whole-DB logical size estimate |
@@ -235,20 +202,20 @@ Bucket:
 Removed (disk-era machinery the pure-memory engine does not need):
 
 - mmap'd file, `fdatasync`/`msync`, WAL, file lock, `Mlock`, `grow`.
-- The on-disk freelist package; allocation is a per-bucket monotonic counter +
+- The on-disk freelist package; allocation is a global monotonic counter +
   LIFO recycle.
 - The `cmd/bbolt` CLI and the `internal/{surgeon,guts_cli,freelist,tests}` +
   `tests/*` disk tooling.
 - Nested buckets — only **flat top-level** buckets are supported.
 - Disk-oriented `Options` fields (`NoSync`, `MmapFlags`, `InitialMmapSize`,
   `FreelistType`, `Mlock`, `Timeout`, …) and `DB.Sync`/`grow`/`loadFreelist`.
-- `Tx.Page` (node ids are bucket-local) and `Tx.Check` (currently a no-op stub).
+- `Tx.Page` and `Tx.Check` (currently a no-op stub).
 
 Added:
 
-- Per-bucket atomic publish, `Nid = BucketId|NodeId`, per-bucket id recycling.
+- Global in-memory publication via `dbState`, global Nid recycling.
 - BMSP snapshot format + `Open` auto-restore.
-- `Tx.Cursor()` over sorted top-level bucket names; commit groups for joint atomicity.
+- `Tx.Cursor()` over sorted top-level bucket names.
 
 ---
 
@@ -258,17 +225,11 @@ Added:
   snapshot. vmbolt is *not* a replacement for a durable store.
 - **Single writer.** One write transaction at a time (global lock). Reads are
   concurrent with the writer.
-- **No cross-bucket atomicity by default.** Use a [commit group](#commit-groups-atomic-bucket-groups)
-  for the buckets that must advance together.
-- **Lazy per-bucket read snapshot.** A read tx pins each bucket on first access,
-  not at `Begin`; a long-lived read tx that waits before reading a bucket will
-  see that bucket's then-current generation.
-- **≤ 65 535 top-level buckets** (16-bit `BucketId`, recycled on delete).
+- **Flat top-level buckets only.** Nested bucket APIs were removed.
 - **Byte slices from `Get`/`Cursor` are valid only for the transaction's
   lifetime** (they reference shared immutable storage). Copy them if you need
   them beyond the tx.
-- **`Tx.Check` is a no-op stub** (returns no errors). Consistency checking is
-  not yet implemented for the per-bucket model.
+- **`Tx.Check` is a no-op stub** (returns no errors).
 
 ---
 
@@ -281,7 +242,7 @@ present:
 - sorted `Tx.Cursor()` (deterministic `Hash`/snapshot),
 - `Tx.WriteTo`/snapshot streaming (BMSP),
 - `Tx.Size()`,
-- a commit group so `meta` + `key` stay jointly consistent.
+- one globally consistent transaction view, so `meta` + `key` advance together.
 
 The fundamental gap is **durability**: etcd requires a durable, recoverable
 backend, while vmbolt is memory-only (snapshot-on-demand, volatile between

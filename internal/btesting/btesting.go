@@ -190,9 +190,9 @@ func (db *DB) CopyTempFile() {
 func (db *DB) PrintStats() {
 	var stats = db.Stats()
 	fmt.Printf("[db] %-20s %-20s %-20s\n",
-		fmt.Sprintf("pg(%d)", stats.TxStats.GetPageCount()),
 		fmt.Sprintf("cur(%d)", stats.TxStats.GetCursorCount()),
 		fmt.Sprintf("node(%d/%d)", stats.TxStats.GetNodeCount(), stats.TxStats.GetNodeDeref()),
+		fmt.Sprintf("split(%d)", stats.TxStats.GetSplit()),
 	)
 	fmt.Printf("     %-20s %-20s %-20s\n",
 		fmt.Sprintf("rebal(%d/%v)", stats.TxStats.GetRebalance(), truncDuration(stats.TxStats.GetRebalanceTime())),
