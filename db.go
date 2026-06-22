@@ -66,7 +66,6 @@ func (db *DB) String() string {
 // Passing in nil options will cause Bolt to open the database with the default options.
 func Open(path string, mode os.FileMode, options *Options) (db *DB, err error) {
 	db = &DB{}
-	db.opened.Store(true)
 
 	// Set default options if no options are provided.
 	if options == nil {
@@ -115,6 +114,7 @@ func Open(path string, mode os.FileMode, options *Options) (db *DB, err error) {
 			return nil, rerr
 		}
 	}
+	db.opened.Store(true)
 
 	// Mark the database as opened and return.
 	return db, nil

@@ -120,7 +120,7 @@ func checkErrors(db *btesting.DB) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	for err := range tx.Check() {
 		return err
 	}

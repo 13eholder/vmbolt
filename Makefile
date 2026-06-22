@@ -32,9 +32,15 @@ fmt:
 	@echo "Verifying goimports, failures can be fixed with ./scripts/fix.sh"
 	@!(go run golang.org/x/tools/cmd/goimports@latest -l -d ${GOFILES} | grep '[a-z]')
 
+# golangci-lint is built with an older Go than a newer system Go may provide;
+# pin the run to .go-version so the linter can typecheck the standard library
+# (a go1.24-built linter cannot parse a //go:build go1.26 stdlib). Prefer a
+# PATH-resolved golangci-lint (CI); fall back to ./bin/golangci-lint locally.
+GOLANGCI_LINT ?= $(shell command -v golangci-lint 2>/dev/null || echo ./bin/golangci-lint)
+
 .PHONY: lint
 lint:
-	golangci-lint run ./...
+	GOTOOLCHAIN=go$$(cat .go-version) $(GOLANGCI_LINT) run ./...
 
 .PHONY: test
 test:
