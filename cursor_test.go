@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
-	"os"
 	"reflect"
 	"sort"
 	"testing"
@@ -756,14 +755,12 @@ func TestCursor_QuickCheck_Reverse(t *testing.T) {
 	}
 }
 
-
 func ExampleCursor() {
 	// Open the database.
 	db, err := bolt.Open(tempfile(), 0600, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer os.Remove(db.Path())
 
 	// Start a read-write transaction.
 	if err := db.Update(func(tx *bolt.Tx) error {
@@ -817,7 +814,6 @@ func ExampleCursor_reverse() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer os.Remove(db.Path())
 
 	// Start a read-write transaction.
 	if err := db.Update(func(tx *bolt.Tx) error {

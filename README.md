@@ -172,7 +172,7 @@ Database:
 | `Update(fn)` / `View(fn)` / `Batch(fn)` | Managed read-write / read-only / batched tx |
 | `Begin(writable)` | Manual transaction (remember to `Commit`/`Rollback`) |
 | `Restore(r)` | Rehydrate from a BMSP reader |
-| `Stats()`, `Info()`, `Path()`, `Logger()` | Diagnostics |
+| `Stats()`, `Info()`, `Logger()` | Diagnostics |
 
 Transaction:
 
@@ -192,7 +192,6 @@ Bucket:
 |--------|-------|
 | `Put` / `Get` / `Delete` | Key/value ops |
 | `ForEach(fn)` / `Cursor()` | Sorted iteration / point lookup |
-| `Sequence` / `SetSequence` / `NextSequence` | Per-bucket autoincrement |
 | `Stats()` | Per-bucket statistics |
 
 ---
@@ -209,7 +208,7 @@ Removed (disk-era machinery the pure-memory engine does not need):
 - Nested buckets — only **flat top-level** buckets are supported.
 - Disk-oriented `Options` fields (`NoSync`, `MmapFlags`, `InitialMmapSize`,
   `FreelistType`, `Mlock`, `Timeout`, …) and `DB.Sync`/`grow`/`loadFreelist`.
-- `Tx.Page` and `Tx.Check` (currently a no-op stub).
+- `Tx.Page` (removed); `Tx.Check` is retained as a no-op stub that returns no errors.
 
 Added:
 

@@ -34,14 +34,11 @@ type DB struct {
 
 	logger Logger
 
-	path   string
-	opened bool
-	rwtx   *Tx
+	opened atomic.Bool
 	stats  *Stats
 
 	// state is the single publication point for the whole database view.
 	state atomic.Pointer[dbState]
-	txid  atomic.Uint64
 
 	batchMu sync.Mutex
 	batch   *batch
@@ -54,28 +51,22 @@ type DB struct {
 	readOnly bool
 }
 
-// Path returns the path to currently open database file.
-func (db *DB) Path() string {
-	return db.path
-}
-
 // GoString returns the Go string representation of the database.
 func (db *DB) GoString() string {
-	return fmt.Sprintf("bolt.DB{path:%q}", db.path)
+	return "vmbolt.DB"
 }
 
 // String returns the string representation of the database.
 func (db *DB) String() string {
-	return fmt.Sprintf("DB<%q>", db.path)
+	return "vmbolt.DB"
 }
 
 // Open creates and opens a database at the given path with a given file mode.
 // If the file does not exist then it will be created automatically with a given file mode.
 // Passing in nil options will cause Bolt to open the database with the default options.
 func Open(path string, mode os.FileMode, options *Options) (db *DB, err error) {
-	db = &DB{
-		opened: true,
-	}
+	db = &DB{}
+	db.opened.Store(true)
 
 	// Set default options if no options are provided.
 	if options == nil {
@@ -108,8 +99,6 @@ func Open(path string, mode os.FileMode, options *Options) (db *DB, err error) {
 			}
 		}()
 	}
-
-	db.path = path
 
 	// Initialize the database.
 	if err = db.init(); err != nil {
@@ -174,13 +163,12 @@ func (db *DB) Close() error {
 }
 
 func (db *DB) close() error {
-	if !db.opened {
+	if !db.opened.Load() {
 		return nil
 	}
 
-	db.opened = false
+	db.opened.Store(false)
 	db.state.Store(nil)
-	db.path = ""
 
 	return nil
 }
@@ -212,7 +200,7 @@ func (db *DB) Logger() Logger {
 }
 
 func (db *DB) beginTx() (*Tx, error) {
-	if !db.opened {
+	if !db.opened.Load() {
 		return nil, berrors.ErrDatabaseNotOpen
 	}
 	base := db.state.Load()
@@ -223,7 +211,6 @@ func (db *DB) beginTx() (*Tx, error) {
 	t := &Tx{
 		db:   db,
 		base: base,
-		id:   db.txid.Add(1),
 	}
 
 	if db.stats != nil {
@@ -243,7 +230,7 @@ func (db *DB) beginRWTx() (*Tx, error) {
 
 	db.rwlock.Lock()
 
-	if !db.opened {
+	if !db.opened.Load() {
 		db.rwlock.Unlock()
 		return nil, berrors.ErrDatabaseNotOpen
 	}
@@ -258,11 +245,9 @@ func (db *DB) beginRWTx() (*Tx, error) {
 		db:       db,
 		writable: true,
 		base:     base,
-		id:       db.txid.Add(1),
 		nextNid:  base.nextNid,
 		freeNids: append([]common.Nid(nil), base.freeNid...),
 	}
-	db.rwtx = t
 	return t, nil
 }
 

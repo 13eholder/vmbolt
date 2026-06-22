@@ -987,7 +987,6 @@ func ExampleBucket_Put() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer os.Remove(db.Path())
 
 	// Start a write transaction.
 	if err := db.Update(func(tx *bolt.Tx) error {
@@ -1030,7 +1029,6 @@ func ExampleBucket_Delete() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer os.Remove(db.Path())
 
 	// Start a write transaction.
 	if err := db.Update(func(tx *bolt.Tx) error {
@@ -1088,7 +1086,6 @@ func ExampleBucket_ForEach() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer os.Remove(db.Path())
 
 	// Insert data into a bucket.
 	if err := db.Update(func(tx *bolt.Tx) error {

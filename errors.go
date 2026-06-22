@@ -58,12 +58,6 @@ var (
 	//
 	// Deprecated: Use the error variables defined in the vmbolt/errors package.
 	ErrDatabaseReadOnly = errors.ErrDatabaseReadOnly
-
-	// ErrFreePagesNotLoaded is returned when a readonly transaction without
-	// preloading the free pages is trying to access the free pages.
-	//
-	// Deprecated: Use the error variables defined in the vmbolt/errors package.
-	ErrFreePagesNotLoaded = errors.ErrFreePagesNotLoaded
 )
 
 // These errors can occur when putting or deleting a value or a bucket.

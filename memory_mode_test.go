@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-
 )
 
 func TestMemoryMode_BasicCRUD(t *testing.T) {

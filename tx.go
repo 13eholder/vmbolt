@@ -21,7 +21,6 @@ type Tx struct {
 	managed  bool
 	db       *DB
 
-	id   uint64
 	base *dbState
 
 	// Per-bucket tx-local contexts, created lazily by Bucket/CreateBucket/etc.
@@ -278,12 +277,12 @@ func (tx *Tx) freeNid(id common.Nid) {
 func (tx *Tx) Commit() (err error) {
 	lg := tx.db.Logger()
 	if lg != discardLogger {
-		lg.Debugf("Committing transaction %d", tx.id)
+		lg.Debugf("Committing transaction")
 		defer func() {
 			if err != nil {
 				lg.Errorf("Committing transaction failed: %v", err)
 			} else {
-				lg.Debugf("Committing transaction %d successfully", tx.id)
+				lg.Debugf("Committing transaction successfully")
 			}
 		}()
 	}
@@ -365,8 +364,6 @@ func (tx *Tx) close() {
 		return
 	}
 	if tx.writable {
-		tx.db.rwtx = nil
-
 		for _, b := range tx.bctx {
 			for _, n := range b.dirty {
 				releaseWorkNode(n)

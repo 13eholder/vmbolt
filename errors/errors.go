@@ -42,10 +42,6 @@ var (
 	// ErrDatabaseReadOnly is returned when a mutating transaction is started on a
 	// read-only database.
 	ErrDatabaseReadOnly = errors.New("database is in read-only mode")
-
-	// ErrFreePagesNotLoaded is returned when a readonly transaction without
-	// preloading the free pages is trying to access the free pages.
-	ErrFreePagesNotLoaded = errors.New("free pages are not pre-loaded")
 )
 
 // These errors can occur when putting or deleting a value or a bucket.
@@ -76,10 +72,4 @@ var (
 	// on an existing non-bucket key or when trying to create or delete a
 	// non-bucket key on an existing bucket key.
 	ErrIncompatibleValue = errors.New("incompatible value")
-
-	// ErrSameBuckets is retained for API compatibility.
-	ErrSameBuckets = errors.New("the source and target are the same bucket")
-
-	// ErrDifferentDB is retained for API compatibility.
-	ErrDifferentDB = errors.New("the source and target buckets are in different database files")
 )

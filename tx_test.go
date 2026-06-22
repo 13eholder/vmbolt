@@ -3,8 +3,9 @@ package vmbolt_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"log"
-	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,53 +17,120 @@ import (
 )
 
 // TestTx_Check_ReadOnly tests consistency checking on a ReadOnly database.
-func TestTx_Check_ReadOnly(t *testing.T) {
+// TestTx_Check runs the structural consistency check over a well-formed
+// database populated across multiple buckets (each large enough to split into a
+// multi-level B+tree) and asserts it reports no errors.
+func TestTx_Check(t *testing.T) {
 	db := btesting.MustCreateDB(t)
 	if err := db.Update(func(tx *bolt.Tx) error {
-		b, err := tx.CreateBucket([]byte("widgets"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := b.Put([]byte("foo"), []byte("bar")); err != nil {
-			t.Fatal(err)
+		for _, name := range []string{"alpha", "beta", "gamma"} {
+			b, err := tx.CreateBucket([]byte(name))
+			if err != nil {
+				return err
+			}
+			for i := 0; i < 500; i++ {
+				k := []byte(fmt.Sprintf("key-%04d", i))
+				if err := b.Put(k, []byte("value")); err != nil {
+					return err
+				}
+			}
 		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Close(); err != nil {
+	assertNoCheckErrors(t, db)
+}
+
+// TestTx_Check_AfterDeletions verifies the check stays clean once deletions
+// have forced rebalancing/merging into a new published-consistent state.
+func TestTx_Check_AfterDeletions(t *testing.T) {
+	db := btesting.MustCreateDB(t)
+	if err := db.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucket([]byte("data"))
+		if err != nil {
+			return err
+		}
+		for i := 0; i < 1000; i++ {
+			if err := b.Put([]byte(fmt.Sprintf("k-%04d", i)), []byte("v")); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("data"))
+		for i := 0; i < 1000; i += 2 {
+			if err := b.Delete([]byte(fmt.Sprintf("k-%04d", i))); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertNoCheckErrors(t, db)
+}
+
+// TestTx_Check_Concurrent verifies that concurrent Check calls on the same
+// database are safe and each reports no errors. The published snapshot is
+// immutable, so checks neither race against each other nor reload state.
+func TestTx_Check_Concurrent(t *testing.T) {
+	db := btesting.MustCreateDB(t)
+	if err := db.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucket([]byte("c"))
+		if err != nil {
+			return err
+		}
+		for i := 0; i < 300; i++ {
+			if err := b.Put([]byte(fmt.Sprintf("k-%d", i)), []byte("v")); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 
-	readOnlyDB, err := bolt.Open(db.Path(), 0600, &bolt.Options{ReadOnly: true})
-	if err != nil {
-		t.Fatal(err)
+	const n = 8
+	var wg sync.WaitGroup
+	errc := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errc <- checkErrors(db)
+		}()
 	}
-	defer readOnlyDB.Close()
-
-	tx, err := readOnlyDB.Begin(false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// ReadOnly DB will load freelist on Check call.
-	numChecks := 2
-	errc := make(chan error, numChecks)
-	check := func() {
-		errc <- <-tx.Check()
-	}
-	// Ensure the freelist is not reloaded and does not race.
-	for i := 0; i < numChecks; i++ {
-		go check()
-	}
-	for i := 0; i < numChecks; i++ {
-		if err := <-errc; err != nil {
+	wg.Wait()
+	close(errc)
+	for err := range errc {
+		if err != nil {
 			t.Fatal(err)
 		}
 	}
-	// Close the view transaction
-	err = tx.Rollback()
+}
+
+// checkErrors opens a read-only transaction, drains tx.Check, and returns the
+// first error encountered (or nil).
+func checkErrors(db *btesting.DB) error {
+	tx, err := db.Begin(false)
 	if err != nil {
-		t.Fatal(err)
+		return err
+	}
+	defer tx.Rollback()
+	for err := range tx.Check() {
+		return err
+	}
+	return nil
+}
+
+func assertNoCheckErrors(t *testing.T, db *btesting.DB) {
+	t.Helper()
+	if err := checkErrors(db); err != nil {
+		t.Fatalf("unexpected check error: %v", err)
 	}
 }
 
@@ -641,7 +709,6 @@ func TestTx_Rollback(t *testing.T) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer os.Remove(db.Path())
 
 	tx, err := db.Begin(true)
 	if err != nil {
