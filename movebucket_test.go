@@ -144,7 +144,7 @@ func TestTx_MoveBucket(t *testing.T) {
 	for _, tc := range testCases {
 
 		t.Run(tc.name, func(*testing.T) {
-			db := btesting.MustCreateDBWithOption(t, &vmbolt.Options{PageSize: 4096})
+			db := btesting.MustCreateDB(t)
 
 			dumpBucketBeforeMoving := filepath.Join(t.TempDir(), "dbBeforeMove")
 			dumpBucketAfterMoving := filepath.Join(t.TempDir(), "dbAfterMove")
@@ -226,7 +226,7 @@ func TestBucket_MoveBucket_DiffDB(t *testing.T) {
 	var srcBucket *vmbolt.Bucket
 
 	t.Log("Creating source bucket and populate some data")
-	srcDB := btesting.MustCreateDBWithOption(t, &vmbolt.Options{PageSize: 4096})
+	srcDB := btesting.MustCreateDB(t)
 	err := srcDB.Update(func(tx *vmbolt.Tx) error {
 		srcBucket = prepareBuckets(t, tx, srcBucketPath...)
 		return nil
@@ -237,7 +237,7 @@ func TestBucket_MoveBucket_DiffDB(t *testing.T) {
 	}()
 
 	t.Log("Creating target bucket and populate some data")
-	dstDB := btesting.MustCreateDBWithOption(t, &vmbolt.Options{PageSize: 4096})
+	dstDB := btesting.MustCreateDB(t)
 	err = dstDB.Update(func(tx *vmbolt.Tx) error {
 		prepareBuckets(t, tx, dstBucketPath...)
 		return nil
@@ -303,7 +303,7 @@ func TestBucket_MoveBucket_DiffTx(t *testing.T) {
 			var dstBucket *vmbolt.Bucket
 
 			t.Log("Creating source and target buckets and populate some data")
-			db := btesting.MustCreateDBWithOption(t, &vmbolt.Options{PageSize: 4096})
+			db := btesting.MustCreateDB(t)
 			err := db.Update(func(tx *vmbolt.Tx) error {
 				srcBucket = prepareBuckets(t, tx, tc.srcBucketPath...)
 				dstBucket = prepareBuckets(t, tx, tc.dstBucketPath...)

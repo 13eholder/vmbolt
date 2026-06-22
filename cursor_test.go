@@ -39,7 +39,7 @@ func TestCursor_RepeatOperations(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			db := btesting.MustCreateDBWithOption(t, &bolt.Options{PageSize: 4096})
+			db := btesting.MustCreateDB(t)
 
 			bucketName := []byte("data")
 

@@ -35,9 +35,6 @@ func cloneBucket(src *bolt.Bucket, dst *bolt.Bucket) error {
 			if err != nil {
 				return err
 			}
-			if err = dstChild.SetSequence(srcChild.Sequence()); err != nil {
-				return err
-			}
 
 			return cloneBucket(srcChild, dstChild)
 		}

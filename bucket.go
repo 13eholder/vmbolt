@@ -37,8 +37,6 @@ type Bucket struct {
 	dirty    map[common.Nid]*workNode // tx-local mutable node cache (write tx only)
 	obsolete map[common.Nid]struct{}  // node ids freed in this tx (write tx only)
 
-	sequence uint64 // tx-local mutable sequence (initialized from base)
-
 	// Rollback snapshot of the handle's writer-private allocator state.
 	snapNextNode uint64
 	snapFreeIds  []uint64
@@ -170,41 +168,6 @@ func (b *Bucket) Delete(key []byte) (err error) {
 	return nil
 }
 
-// Sequence returns the current integer for the bucket without incrementing it.
-func (b *Bucket) Sequence() uint64 {
-	return b.sequence
-}
-
-// SetSequence updates the sequence number for the bucket.
-func (b *Bucket) SetSequence(v uint64) error {
-	if b.tx.db == nil {
-		return errors.ErrTxClosed
-	} else if !b.Writable() {
-		return errors.ErrTxNotWritable
-	}
-	// Materialize the root node if it hasn't been already, so the bucket is
-	// saved during commit even if only the sequence changed.
-	if b.rootNode == nil {
-		_ = b.node(b.Root(), nil)
-	}
-	b.sequence = v
-	return nil
-}
-
-// NextSequence returns an autoincrementing integer for the bucket.
-func (b *Bucket) NextSequence() (uint64, error) {
-	if b.tx.db == nil {
-		return 0, errors.ErrTxClosed
-	} else if !b.Writable() {
-		return 0, errors.ErrTxNotWritable
-	}
-	if b.rootNode == nil {
-		_ = b.node(b.Root(), nil)
-	}
-	b.sequence++
-	return b.sequence, nil
-}
-
 // ForEach executes a function for each key/value pair in a bucket.
 func (b *Bucket) ForEach(fn func(k, v []byte) error) error {
 	if b.tx.db == nil {
@@ -284,8 +247,6 @@ func (b *Bucket) recursivelyInspect(name []byte) BucketStructure {
 // Stats returns stats on a bucket.
 func (b *Bucket) Stats() BucketStats {
 	var s BucketStats
-	pageSize := b.tx.db.pageSize
-	s.BucketN = 1
 	b.forEachNode(func(n *node, depth int) {
 		if n.isLeaf {
 			s.KeyN += len(n.inodes)
@@ -293,10 +254,8 @@ func (b *Bucket) Stats() BucketStats {
 			for _, inode := range n.inodes {
 				used += uintptr(nodeInodeOverheadBytes) + uintptr(len(inode.Key())) + uintptr(len(inode.Value()))
 			}
-			s.LeafPageN++
 			s.LeafInuse += int(used)
 		} else {
-			s.BranchPageN++
 			used := uintptr(nodeHeaderOverheadBytes)
 			for _, inode := range n.inodes {
 				used += uintptr(nodeInodeOverheadBytes) + uintptr(len(inode.Key()))
@@ -307,8 +266,6 @@ func (b *Bucket) Stats() BucketStats {
 			s.Depth = depth + 1
 		}
 	})
-	s.BranchAlloc = s.BranchPageN * pageSize
-	s.LeafAlloc = s.LeafPageN * pageSize
 	return s
 }
 
@@ -427,7 +384,6 @@ func (b *Bucket) pageNode(id common.Nid) *node {
 func (b *Bucket) allocate() (common.Nid, error) {
 	nid := b.handle.allocNode()
 	b.tx.stats.IncPageCount(1)
-	b.tx.stats.IncPageAlloc(int64(b.tx.db.pageSize))
 	return nid, nil
 }
 
@@ -533,45 +489,22 @@ func (b *Bucket) size() int64 {
 
 // BucketStats records statistics about resources used by a bucket.
 type BucketStats struct {
-	// Page count statistics.
-	BranchPageN     int // number of logical branch pages
-	BranchOverflowN int // number of physical branch overflow pages
-	LeafPageN       int // number of logical leaf pages
-	LeafOverflowN   int // number of physical leaf overflow pages
-
 	// Tree statistics.
 	KeyN  int // number of keys/value pairs
 	Depth int // number of levels in B+tree
 
 	// Page size utilization.
-	BranchAlloc int // bytes allocated for physical branch pages
 	BranchInuse int // bytes actually used for branch data
-	LeafAlloc   int // bytes allocated for physical leaf pages
 	LeafInuse   int // bytes actually used for leaf data
-
-	// Bucket statistics
-	BucketN           int // total number of buckets including the top bucket
-	InlineBucketN     int // always 0 in pure memory mode; kept for API compatibility
-	InlineBucketInuse int // always 0 in pure memory mode; kept for API compatibility
 }
 
 func (s *BucketStats) Add(other BucketStats) {
-	s.BranchPageN += other.BranchPageN
-	s.BranchOverflowN += other.BranchOverflowN
-	s.LeafPageN += other.LeafPageN
-	s.LeafOverflowN += other.LeafOverflowN
 	s.KeyN += other.KeyN
 	if s.Depth < other.Depth {
 		s.Depth = other.Depth
 	}
-	s.BranchAlloc += other.BranchAlloc
 	s.BranchInuse += other.BranchInuse
-	s.LeafAlloc += other.LeafAlloc
 	s.LeafInuse += other.LeafInuse
-
-	s.BucketN += other.BucketN
-	s.InlineBucketN += other.InlineBucketN
-	s.InlineBucketInuse += other.InlineBucketInuse
 }
 
 // BucketStructure records the structure of a bucket.

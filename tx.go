@@ -574,7 +574,6 @@ type errorWriter interface {
 // TxStats represents statistics about the actions performed by the transaction.
 type TxStats struct {
 	PageCount     int64
-	PageAlloc     int64
 	CursorCount   int64
 	NodeCount     int64
 	NodeDeref     int64
@@ -589,7 +588,6 @@ type TxStats struct {
 
 func (s *TxStats) add(other *TxStats) {
 	s.IncPageCount(other.GetPageCount())
-	s.IncPageAlloc(other.GetPageAlloc())
 	s.IncCursorCount(other.GetCursorCount())
 	s.IncNodeCount(other.GetNodeCount())
 	s.IncNodeDeref(other.GetNodeDeref())
@@ -606,7 +604,6 @@ func (s *TxStats) add(other *TxStats) {
 func (s *TxStats) Sub(other *TxStats) TxStats {
 	var diff TxStats
 	diff.PageCount = s.GetPageCount() - other.GetPageCount()
-	diff.PageAlloc = s.GetPageAlloc() - other.GetPageAlloc()
 	diff.CursorCount = s.GetCursorCount() - other.GetCursorCount()
 	diff.NodeCount = s.GetNodeCount() - other.GetNodeCount()
 	diff.NodeDeref = s.GetNodeDeref() - other.GetNodeDeref()
@@ -626,14 +623,6 @@ func (s *TxStats) GetPageCount() int64 {
 
 func (s *TxStats) IncPageCount(delta int64) int64 {
 	return atomic.AddInt64(&s.PageCount, delta)
-}
-
-func (s *TxStats) GetPageAlloc() int64 {
-	return atomic.LoadInt64(&s.PageAlloc)
-}
-
-func (s *TxStats) IncPageAlloc(delta int64) int64 {
-	return atomic.AddInt64(&s.PageAlloc, delta)
 }
 
 func (s *TxStats) GetCursorCount() int64 {

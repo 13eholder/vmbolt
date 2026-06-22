@@ -34,11 +34,10 @@ type DB struct {
 
 	logger Logger
 
-	path     string
-	pageSize int
-	opened   bool
-	rwtx     *Tx
-	stats    *Stats
+	path   string
+	opened bool
+	rwtx   *Tx
+	stats  *Stats
 
 	// Per-bucket directory: name -> bucketHandle. Reads look it up under
 	// bucketsMu.RLock; create/delete mutate it under the write side (which the
@@ -457,7 +456,7 @@ func (db *DB) Stats() Stats {
 
 // Info returns information about the database.
 func (db *DB) Info() *Info {
-	return &Info{0, db.pageSize}
+	return &Info{0}
 }
 
 // allocBucketId returns a fresh 16-bit BucketId for a new bucket, reusing a
@@ -492,9 +491,6 @@ type Options struct {
 	// ReadOnly opens the database in read-only mode.
 	ReadOnly bool
 
-	// PageSize overrides the default page size used for size/statistics estimates.
-	PageSize int
-
 	// Logger is the logger used for vmbolt.
 	Logger Logger
 
@@ -506,8 +502,8 @@ func (o *Options) String() string {
 	if o == nil {
 		return "{}"
 	}
-	return fmt.Sprintf("{ReadOnly: %t, PageSize: %d, Logger: %p, NoStatistics: %t}",
-		o.ReadOnly, o.PageSize, o.Logger, o.NoStatistics)
+	return fmt.Sprintf("{ReadOnly: %t, Logger: %p, NoStatistics: %t}",
+		o.ReadOnly, o.Logger, o.NoStatistics)
 }
 
 // DefaultOptions represent the options used if nil options are passed into Open().
@@ -545,6 +541,5 @@ func (s *Stats) Sub(other *Stats) Stats {
 }
 
 type Info struct {
-	Data     uintptr
-	PageSize int
+	Data uintptr
 }

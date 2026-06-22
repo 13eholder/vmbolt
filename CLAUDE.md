@@ -48,7 +48,7 @@ and there is no shared on-disk page layer.
 - **Per-bucket publish** — `DB.buckets` is a `map[string]*bucketHandle`. Each
   `bucketHandle` owns an `atomic.Pointer[bucketState]`; readers dereference it lock-free.
   `bucketState` (`bucket_state.go`) is the immutable published generation:
-  `{id, root Nid, nodes map[Nid]*snapNode, sequence}`. A commit rebuilds and republishes
+  `{id, root Nid, nodes map[Nid]*snapNode}`. A commit rebuilds and republishes
   *only the buckets the tx touched*.
 - **Two node shapes** (`snapshot_node.go`) — `snapNode` is immutable and shared across
   transactions; `workNode` is tx-local and mutable. Copy-on-write flows through

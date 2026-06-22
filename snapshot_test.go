@@ -117,9 +117,6 @@ func TestSnapshot_RoundTrip(t *testing.T) {
 					return err
 				}
 			}
-			if err := b.SetSequence(uint64(len(name))); err != nil {
-				return err
-			}
 		}
 		return nil
 	}))
@@ -154,11 +151,8 @@ func TestSnapshot_RoundTrip(t *testing.T) {
 		t.Fatalf("restored size = %d, want > 0", got)
 	}
 
-	// Spot-check sequence + a key.
+	// Spot-check a key after restore.
 	mustOk(t, dst.View(func(tx *Tx) error {
-		if got := tx.Bucket([]byte("mango")).Sequence(); got != uint64(len("mango")) {
-			t.Fatalf("mango sequence = %d, want %d", got, len("mango"))
-		}
 		if v := tx.Bucket([]byte("mango")).Get([]byte(bytefmt("key-%05d", 2999))); v == nil {
 			t.Fatal("missing mango key-02999 after restore")
 		}

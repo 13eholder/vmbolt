@@ -21,12 +21,11 @@ import (
 //	  header (16 bytes):
 //	    magic    [4]byte  "BMSP"
 //	    version  uint32   = snapshotVersion
-//	    pageSize uint32   (informational; the engine is page-less)
+//	    reserved uint32   = 0
 //	    reserved uint32   = 0
 //	  repeated bucket record (terminated by nameLen == 0):
 //	    nameLen  uint32   (>0)
 //	    name     [nameLen]byte
-//	    sequence uint64
 //	    repeated kv pair (terminated by keyLen == 0):
 //	      keyLen uint32   (>0)
 //	      key    [keyLen]byte
@@ -60,7 +59,7 @@ func (tx *Tx) serializeSnapshot(w io.Writer) (int64, error) {
 	hdr := make([]byte, 16)
 	copy(hdr[0:4], snapshotMagicBytes)
 	binary.LittleEndian.PutUint32(hdr[4:8], snapshotVersion)
-	binary.LittleEndian.PutUint32(hdr[8:12], uint32(tx.db.pageSize))
+	binary.LittleEndian.PutUint32(hdr[8:12], 0)
 	binary.LittleEndian.PutUint32(hdr[12:16], 0)
 	if _, err := cw.Write(hdr); err != nil {
 		return cw.n, err
@@ -76,16 +75,12 @@ func (tx *Tx) serializeSnapshot(w io.Writer) (int64, error) {
 		if b == nil {
 			continue
 		}
-		// name + sequence
+		// name
 		binary.LittleEndian.PutUint32(buf4[:], uint32(len(name)))
 		if _, err := cw.Write(buf4[:]); err != nil {
 			return cw.n, err
 		}
 		if _, err := cw.Write(name); err != nil {
-			return cw.n, err
-		}
-		binary.LittleEndian.PutUint64(buf8[:], b.Sequence())
-		if _, err := cw.Write(buf8[:]); err != nil {
 			return cw.n, err
 		}
 
@@ -139,7 +134,7 @@ func (db *DB) Restore(r io.Reader) error {
 	if v := binary.LittleEndian.Uint32(hdr[4:8]); v != snapshotVersion {
 		return fmt.Errorf("vmbolt: unsupported snapshot version %d", v)
 	}
-	// hdr[8:12] pageSize is informational; ignored.
+	// hdr[8:16] are reserved; ignored.
 
 	return db.Update(func(tx *Tx) error {
 		var buf4 [4]byte
@@ -156,11 +151,6 @@ func (db *DB) Restore(r io.Reader) error {
 			if _, err := io.ReadFull(r, name); err != nil {
 				return fmt.Errorf("vmbolt: snapshot bucket name: %w", err)
 			}
-			if _, err := io.ReadFull(r, buf8[:]); err != nil {
-				return fmt.Errorf("vmbolt: snapshot bucket seq: %w", err)
-			}
-			sequence := binary.LittleEndian.Uint64(buf8[:])
-
 			b, err := tx.CreateBucket(name)
 			if err != nil {
 				return fmt.Errorf("vmbolt: restore bucket %q: %w", name, err)
@@ -189,9 +179,6 @@ func (db *DB) Restore(r io.Reader) error {
 				if err := b.Put(key, val); err != nil {
 					return fmt.Errorf("vmbolt: restore put %q: %w", key, err)
 				}
-			}
-			if err := b.SetSequence(sequence); err != nil {
-				return err
 			}
 		}
 	})

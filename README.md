@@ -103,7 +103,7 @@ The database is a directory of named buckets:
 ```
 DB.buckets  map[string]*bucketHandle
               └─ each handle owns atomic.Pointer[bucketState]
-                 bucketState{ root, nodes map[Nid]*snapNode, sequence }
+                 bucketState{ root, nodes map[Nid]*snapNode }
 ```
 
 - Each top-level bucket is its own B+tree, published through its own atomic
