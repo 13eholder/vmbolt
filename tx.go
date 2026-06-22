@@ -7,8 +7,8 @@ import (
 	"time"
 	"unsafe"
 
-	berrors "13eholder/vmbolt/errors"
-	"13eholder/vmbolt/internal/common"
+	berrors "github.com/13eholder/vmbolt/errors"
+	"github.com/13eholder/vmbolt/internal/common"
 )
 
 // Tx represents a read-only or read/write transaction on the database.

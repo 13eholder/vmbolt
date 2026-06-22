@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sort"
 
-	"13eholder/vmbolt/internal/common"
+	"github.com/13eholder/vmbolt/internal/common"
 )
 
 const (

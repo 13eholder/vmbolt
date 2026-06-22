@@ -11,9 +11,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	bolt "13eholder/vmbolt"
-	berrors "13eholder/vmbolt/errors"
-	"13eholder/vmbolt/internal/btesting"
+	bolt "github.com/13eholder/vmbolt"
+	berrors "github.com/13eholder/vmbolt/errors"
+	"github.com/13eholder/vmbolt/internal/btesting"
 )
 
 // TestTx_Check_ReadOnly tests consistency checking on a ReadOnly database.

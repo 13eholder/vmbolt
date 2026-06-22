@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"13eholder/vmbolt/internal/common"
+	"github.com/13eholder/vmbolt/internal/common"
 )
 
 // These are whitebox tests for the structural Check validators

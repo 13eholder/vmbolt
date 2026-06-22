@@ -11,7 +11,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	bolt "13eholder/vmbolt"
+	bolt "github.com/13eholder/vmbolt"
 )
 
 var statsFlag = flag.Bool("stats", false, "show performance stats")

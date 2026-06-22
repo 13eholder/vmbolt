@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"fmt"
 
-	"13eholder/vmbolt/errors"
-	"13eholder/vmbolt/internal/common"
+	"github.com/13eholder/vmbolt/errors"
+	"github.com/13eholder/vmbolt/internal/common"
 )
 
 const (

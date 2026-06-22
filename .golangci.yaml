@@ -8,10 +8,10 @@ formatters:
       sections:
         - standard
         - default
-        - prefix(13eholder/vmbolt)
+        - prefix(github.com/13eholder/vmbolt)
     goimports:
       local-prefixes:
-        - 13eholder/vmbolt # Put imports beginning with prefix after 3rd-party packages.
+        - github.com/13eholder/vmbolt # Put imports beginning with prefix after 3rd-party packages.
 issues:
   max-same-issues: 0
 linters:

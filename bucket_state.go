@@ -1,6 +1,6 @@
 package vmbolt
 
-import "13eholder/vmbolt/internal/common"
+import "github.com/13eholder/vmbolt/internal/common"
 
 // bucketState is the immutable published state of one top-level bucket.
 // Once published inside a dbState it is never mutated.

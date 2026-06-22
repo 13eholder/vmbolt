@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"sort"
 
-	"13eholder/vmbolt/errors"
-	"13eholder/vmbolt/internal/common"
+	"github.com/13eholder/vmbolt/errors"
+	"github.com/13eholder/vmbolt/internal/common"
 )
 
 // Cursor represents an iterator that can traverse over all key/value pairs in a bucket

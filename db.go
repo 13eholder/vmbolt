@@ -8,8 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	berrors "13eholder/vmbolt/errors"
-	"13eholder/vmbolt/internal/common"
+	berrors "github.com/13eholder/vmbolt/errors"
+	"github.com/13eholder/vmbolt/internal/common"
 )
 
 // DB represents a collection of top-level buckets held in memory.

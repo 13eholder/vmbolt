@@ -1,4 +1,4 @@
-module 13eholder/vmbolt
+module github.com/13eholder/vmbolt
 
 go 1.23
 

@@ -6,7 +6,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	berrors "13eholder/vmbolt/errors"
+	berrors "github.com/13eholder/vmbolt/errors"
 )
 
 func TestBeginTx_StateUnavailable(t *testing.T) {

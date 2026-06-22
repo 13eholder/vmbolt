@@ -16,9 +16,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	bolt "13eholder/vmbolt"
-	berrors "13eholder/vmbolt/errors"
-	"13eholder/vmbolt/internal/btesting"
+	bolt "github.com/13eholder/vmbolt"
+	berrors "github.com/13eholder/vmbolt/errors"
+	"github.com/13eholder/vmbolt/internal/btesting"
 )
 
 // Ensure that a bucket that gets a non-existent key returns nil.

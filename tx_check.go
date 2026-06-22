@@ -7,7 +7,7 @@ import (
 	"sort"
 	"sync"
 
-	"13eholder/vmbolt/internal/common"
+	"github.com/13eholder/vmbolt/internal/common"
 )
 
 // Check performs structural consistency validation of the committed database

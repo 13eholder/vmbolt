@@ -3,7 +3,7 @@
 `vmbolt` is a **pure-memory** key/value store — a fork of
 [bbolt][bbolt] rebuilt around an in-memory node graph instead of an mmap'd file.
 
-- **Module:** `13eholder/vmbolt` · **package:** `vmbolt`
+- **Module:** `github.com/13eholder/vmbolt` · **package:** `vmbolt`
 - Top-level buckets stay **flat** and keep their own B+tree structure, but the
   database publishes **one globally consistent view per transaction commit**.
 - **No on-disk persistence** by default: the whole database lives in process
@@ -42,11 +42,11 @@
 ## Install
 
 ```sh
-go get 13eholder/vmbolt@latest
+go get github.com/13eholder/vmbolt@latest
 ```
 
 ```go
-import "13eholder/vmbolt"
+import "github.com/13eholder/vmbolt"
 
 db, err := vmbolt.Open("", 0600, nil) // path is ignored for storage
 if err != nil {

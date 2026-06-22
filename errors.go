@@ -1,6 +1,6 @@
 package vmbolt
 
-import "13eholder/vmbolt/errors"
+import "github.com/13eholder/vmbolt/errors"
 
 // These errors can be returned when opening or calling methods on a DB.
 var (

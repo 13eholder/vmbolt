@@ -12,8 +12,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	bolt "13eholder/vmbolt"
-	"13eholder/vmbolt/internal/btesting"
+	bolt "github.com/13eholder/vmbolt"
+	"github.com/13eholder/vmbolt/internal/btesting"
 )
 
 // TestCursor_RepeatOperations verifies that a cursor can continue to

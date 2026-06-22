@@ -3,7 +3,7 @@ package vmbolt
 import (
 	"sync"
 
-	"13eholder/vmbolt/internal/common"
+	"github.com/13eholder/vmbolt/internal/common"
 )
 
 // node is the immutable node shape published in dbState snapshots.
