@@ -48,9 +48,14 @@ func TestNode_put(t *testing.T) {
 // Ensure that a node can split into appropriate subgroups.
 func TestNode_split(t *testing.T) {
 	n := &node{inodes: make([]inode, 0), bucket: pbsTestBucket()}
-	for i := 0; i < 1000; i++ {
+	// Insert enough data to exceed defaultMaxNodeSizeBytes and force a split,
+	// regardless of the configured node size. Each entry is ~64 bytes
+	// (24 overhead + 8-byte key + 32-byte value).
+	val := []byte("01234567012345670123456701234567") // 32 bytes
+	entrySize := nodeInodeOverheadBytes + 8 + len(val)
+	count := defaultMaxNodeSizeBytes/entrySize*2 + minKeysPerNode*2 + 1
+	for i := 0; i < count; i++ {
 		key := []byte(fmt.Sprintf("%08d", i))
-		val := []byte("01234567012345670123456701234567")
 		n.put(key, key, val, nil, 0)
 	}
 
