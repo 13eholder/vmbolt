@@ -28,7 +28,6 @@
 - [Quick start](#quick-start)
 - [The model](#the-model)
   - [Flat top-level buckets](#flat-top-level-buckets)
-  - [Global Nid allocator](#global-nid-allocator)
   - [Read snapshot isolation](#read-snapshot-isolation)
   - [Single writer](#single-writer)
 - [Snapshots & restore (BMSP)](#snapshots--restore-bmsp)
@@ -102,26 +101,17 @@ The database is a directory of named top-level buckets held inside one
 published database state:
 
 ```
-DB.state -> dbState{
-  buckets map[string]*bucketState
-  nextNid
-  freeNid
-}
+DB.state -> dbState{ buckets map[string]*bucketState }
 ```
 
-- Each top-level bucket remains its own B+tree.
-- A commit still rebuilds only the buckets it touched internally, but readers
-  observe them through one globally published `dbState`, so a transaction sees
-  one consistent database view across all buckets.
-- Writes use copy-on-write: a write transaction materializes mutable
-  `workNode`s from the immutable `snapNode`s, mutates them, and on commit
-  *freezes* them back into new immutable `snapNode`s (zero-copy inode transfer).
-
-### Global Nid allocator
-
-- `Nid` is a plain globally unique node id.
-- Nid allocation is database-wide, not bucket-scoped.
-- Freed node ids are recycled via a global LIFO freelist carried in `dbState`.
+- Each top-level bucket is a B+tree whose branch entries hold direct `*node`
+  child pointers — the tree itself is the index; there is no flat node-id map.
+- Readers observe all buckets through one globally published `dbState`, so a
+  transaction sees one consistent database view across all buckets.
+- Writes use **path-copy COW**: a write transaction copies only the root-to-leaf
+  path it touches; unchanged subtrees are shared by pointer. Commit publishes one
+  new root pointer per touched bucket — **O(log N)**, not a rebuilt index — so
+  per-commit cost stays nearly flat as a bucket grows.
 
 ### Read snapshot isolation
 
@@ -132,8 +122,9 @@ within a bucket and across buckets.
 ### Single writer
 
 There is one global write lock (`db.Update`/`Begin(true)`). Commit is
-**build-all-then-publish**: touched buckets are rebuilt first, then one new
-`dbState` is atomically published, so a failed commit publishes nothing.
+**path-copy-then-publish**: each touched bucket gets a new root (built by
+copying only the modified path), then one new `dbState` is atomically
+published, so a failed commit publishes nothing.
 
 ---
 
@@ -201,8 +192,8 @@ Bucket:
 Removed (disk-era machinery the pure-memory engine does not need):
 
 - mmap'd file, `fdatasync`/`msync`, WAL, file lock, `Mlock`, `grow`.
-- The on-disk freelist package; allocation is a global monotonic counter +
-  LIFO recycle.
+- The on-disk freelist package and the node-id allocator — nodes are linked by
+  direct `*node` child pointers, so there are no node ids to allocate or recycle.
 - The `cmd/bbolt` CLI and the `internal/{surgeon,guts_cli,freelist,tests}` +
   `tests/*` disk tooling.
 - Nested buckets — only **flat top-level** buckets are supported.
@@ -212,7 +203,8 @@ Removed (disk-era machinery the pure-memory engine does not need):
 
 Added:
 
-- Global in-memory publication via `dbState`, global Nid recycling.
+- Global in-memory publication via `dbState`; structurally-shared persistent
+  B+tree (branch inodes hold `*node` child pointers, path-copy COW on write).
 - BMSP snapshot format + `Open` auto-restore.
 - `Tx.Cursor()` over sorted top-level bucket names.
 

@@ -46,20 +46,19 @@ The core idea: there is **one globally published immutable dbState per commit**,
 and there is no shared on-disk page layer.
 
 - **Global publish** — `DB.state` is an `atomic.Pointer[dbState]`. `dbState`
-  holds the top-level bucket directory plus the global nid allocator snapshot.
-  Readers pin one `dbState` at `Begin`, so one read tx sees one consistent view
-  across all buckets.
-- **Two node shapes** (`snapshot_node.go`) — `snapNode` is immutable and shared across
-  transactions; `workNode` is tx-local and mutable. Copy-on-write flows through
-  `snapNode.materializeWorkNode()` (read→write) and `workNode.freeze()` (write→published,
-  zero-copy inode-slice transfer). Both shell types are recycled via `sync.Pool`
-  (`workNodePool`, `inodesPool`); inode/key/value bytes are never retained across reuse.
-- **Global Nid allocator** — `Nid` (defined in `internal/common/types.go`) is a globally
-  unique uint64. The allocator state (`nextNid`/`freeNid`) lives in `dbState`
-  (`bucket_state.go`) and is snapshotted into write txs (`tx.go`); freed ids are recycled LIFO.
-- **Single writer, global read snapshot** — one global write lock (`DB.rwlock`); commit is
-  build-all-then-publish so a failed commit publishes nothing. A read tx pins the
-  current `dbState` at `Begin`.
+  holds the top-level bucket directory (`map[string]*bucketState`). Readers pin
+  one `dbState` at `Begin`, so one read tx sees one consistent view across all
+  buckets.
+- **Persistent B+tree by pointer** (`snapshot_node.go`, `node.go`) — there is a
+  single `node` type; branch inodes hold `*node` child pointers (no node ids, no
+  flat index). A published tree is immutable and structurally shared across
+  generations. Writes use **path-copy COW**: a write tx copies only the
+  root-to-leaf path it touches (`Bucket.writableRoot`/`childForWrite`/`copyNode`),
+  tracked by a `dirty map[*node]bool` set; unchanged subtrees are shared. Commit
+  publishes one new root pointer per touched bucket — **O(log N)**.
+- **Single writer, global read snapshot** — one global write lock (`DB.rwlock`);
+  commit is path-copy-then-publish so a failed commit publishes nothing. A read
+  tx pins the current `dbState` at `Begin`.
 - **BMSP snapshots** (`snapshot.go`) — non-durable by design, but `Tx.WriteTo`/`CopyFile`
   and `DB.Restore` serialize/restore the whole DB as a deterministic streaming KV dump
   (buckets sorted by name via `Tx.Cursor`, keys sorted within each bucket). `Open(path)`
@@ -68,10 +67,10 @@ and there is no shared on-disk page layer.
 
 ## Key packages
 
-- `.` — `DB`, `Tx`, `Bucket`, `Cursor`, `node`, `snapNode`/`workNode`, `bucketState`,
-  `dbState`, BMSP serialize/restore.
-- `internal/common` — shared low-level types only: `Nid`, `Inode`/`Inodes`,
-  defaults. (No page/mmap code — that was deleted upstream.)
+- `.` — `DB`, `Tx`, `Bucket`, `Cursor`, the unified `node`/`inode` B+tree,
+  `bucketState`, `dbState`, BMSP serialize/restore.
+- `internal/common` — only `defaults` and `Assert` (no page/mmap code, no node
+  types — nodes are linked by pointer in package vmbolt).
 - `internal/btesting` — test `DB` helpers (`MustCreateDB`, `MustReopen`, cleanup); wires
   `TEST_ENABLE_STRICT_MODE`.
 - `errors` — sentinel errors (`ErrBucketNotFound`, `ErrTxClosed`, …).
