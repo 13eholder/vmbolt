@@ -31,10 +31,6 @@ type Tx struct {
 	created map[string]struct{}
 	deleted map[string]struct{}
 
-	// Writer-private global nid allocator snapshot.
-	nextNid  uint64
-	freeNids []common.Nid
-
 	stats          TxStats
 	commitHandlers []func()
 }
@@ -60,14 +56,15 @@ func (tx *Tx) Size() int64 {
 	seen := make(map[string]bool, len(tx.bctx))
 
 	for name, st := range tx.base.buckets {
+		if _, deleted := tx.deleted[name]; deleted {
+			continue
+		}
 		seen[name] = true
 		if b := tx.bctx[name]; b != nil {
 			size += b.size()
 			continue
 		}
-		for _, sn := range st.nodes {
-			size += int64(sn.size())
-		}
+		size += bucketStateSize(st)
 	}
 	for name, b := range tx.bctx {
 		if seen[name] {
@@ -76,6 +73,28 @@ func (tx *Tx) Size() int64 {
 		size += b.size()
 	}
 	return size
+}
+
+// bucketStateSize returns the logical payload size of a committed bucket.
+func bucketStateSize(st *bucketState) int64 {
+	if st == nil || st.root == nil {
+		return 0
+	}
+	var sz int64
+	var walk func(n *node)
+	walk = func(n *node) {
+		if n == nil {
+			return
+		}
+		sz += int64(n.size())
+		if !n.isLeaf {
+			for i := range n.inodes {
+				walk(n.inodes[i].child)
+			}
+		}
+	}
+	walk(st.root)
+	return sz
 }
 
 // Inspect returns the structure of the database: a synthetic "root" whose
@@ -132,7 +151,7 @@ func (tx *Tx) Bucket(name []byte) *Bucket {
 	if st == nil {
 		return nil
 	}
-	b := newBucket(tx, key, st)
+	b := newBucket(tx, key)
 	tx.putBctx(key, b)
 	return b
 }
@@ -156,8 +175,9 @@ func (tx *Tx) CreateBucket(name []byte) (*Bucket, error) {
 		}
 	}
 
-	b := newBucket(tx, key, nil)
-	b.rootNode = &workNode{bucket: b, isLeaf: true}
+	b := newBucket(tx, key)
+	b.rootNode = &node{bucket: b, isLeaf: true}
+	b.dirty[b.rootNode] = true
 	if tx.created == nil {
 		tx.created = make(map[string]struct{})
 	}
@@ -256,24 +276,6 @@ func (tx *Tx) putBctx(key string, b *Bucket) {
 	tx.bctx[key] = b
 }
 
-func (tx *Tx) allocateNid() common.Nid {
-	if n := len(tx.freeNids); n > 0 {
-		id := tx.freeNids[n-1]
-		tx.freeNids = tx.freeNids[:n-1]
-		return id
-	}
-	id := common.Nid(tx.nextNid)
-	tx.nextNid++
-	return id
-}
-
-func (tx *Tx) freeNid(id common.Nid) {
-	if id == 0 {
-		return
-	}
-	tx.freeNids = append(tx.freeNids, id)
-}
-
 // Commit publishes one new globally consistent state.
 func (tx *Tx) Commit() (err error) {
 	lg := tx.db.Logger()
@@ -325,13 +327,11 @@ func (tx *Tx) Commit() (err error) {
 		if _, deleted := tx.deleted[name]; deleted {
 			continue
 		}
-		newBuckets[name] = b.buildPublishedState()
+		newBuckets[name] = b.publishRoot()
 	}
 
 	tx.db.state.Store(&dbState{
 		buckets: newBuckets,
-		nextNid: tx.nextNid,
-		freeNid: append([]common.Nid(nil), tx.freeNids...),
 	})
 
 	tx.close()
@@ -365,12 +365,6 @@ func (tx *Tx) close() {
 		return
 	}
 	if tx.writable {
-		for _, b := range tx.bctx {
-			for _, n := range b.dirty {
-				releaseWorkNode(n)
-			}
-		}
-
 		if tx.db.stats != nil {
 			tx.db.statlock.Lock()
 			tx.db.stats.TxStats.add(&tx.stats)
@@ -387,7 +381,6 @@ func (tx *Tx) close() {
 	tx.bctx = nil
 	tx.created = nil
 	tx.deleted = nil
-	tx.freeNids = nil
 }
 
 // Copy writes the entire database to a writer as a BMSP snapshot (see snapshot.go).

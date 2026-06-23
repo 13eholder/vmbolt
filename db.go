@@ -150,7 +150,6 @@ func (db *DB) maybeRestore(path string) error {
 func (db *DB) init() error {
 	db.state.Store(&dbState{
 		buckets: map[string]*bucketState{},
-		nextNid: 1,
 	})
 	return nil
 }
@@ -246,8 +245,6 @@ func (db *DB) beginRWTx() (*Tx, error) {
 		db:       db,
 		writable: true,
 		base:     base,
-		nextNid:  base.nextNid,
-		freeNids: append([]common.Nid(nil), base.freeNid...),
 	}
 	return t, nil
 }

@@ -3,42 +3,32 @@ package vmbolt
 import (
 	"strings"
 	"testing"
-
-	"github.com/13eholder/vmbolt/internal/common"
 )
 
 // These are whitebox tests for the structural Check validators
-// (checkBucket / checkDBState). Each case constructs a deliberately malformed
-// immutable node graph and asserts the validator catches it; the well-formed
-// cases must yield zero errors.
+// (checkBucket / checkDBState) over the unified *node tree. Each case
+// constructs a deliberately malformed published tree and asserts the validator
+// catches it; the well-formed cases must yield zero errors.
 
 // --- test builders ---
 
-// leafSn builds a leaf snapNode from already-sorted key/value pairs.
-func leafSn(nid common.Nid, kvs ...[2]string) *snapNode {
-	inodes := make([]common.Inode, len(kvs))
+// leafNode builds a leaf node from already-sorted key/value pairs.
+func leafNode(kvs ...[2]string) *node {
+	inodes := make([]inode, len(kvs))
 	for i, kv := range kvs {
-		inodes[i] = common.NewInode(0, 0, []byte(kv[0]), []byte(kv[1]))
+		inodes[i] = inode{key: []byte(kv[0]), value: []byte(kv[1])}
 	}
-	return &snapNode{nid: nid, isLeaf: true, inodes: inodes}
+	return &node{isLeaf: true, inodes: inodes}
 }
 
-// branchSn builds a branch snapNode whose separator keys equal each child's
+// branchNode builds a branch node whose separator keys equal each child's
 // first key (the vmbolt convention enforced by finalize()).
-func branchSn(nid common.Nid, children ...*snapNode) *snapNode {
-	inodes := make([]common.Inode, len(children))
+func branchNode(children ...*node) *node {
+	inodes := make([]inode, len(children))
 	for i, c := range children {
-		inodes[i] = common.NewInode(0, c.nid, c.inodes[0].Key(), nil)
+		inodes[i] = inode{key: c.inodes[0].key, child: c}
 	}
-	return &snapNode{nid: nid, isLeaf: false, inodes: inodes}
-}
-
-func bucketStateFrom(root common.Nid, nodes ...*snapNode) *bucketState {
-	m := make(map[common.Nid]*snapNode, len(nodes))
-	for _, n := range nodes {
-		m[n.nid] = n
-	}
-	return &bucketState{root: root, nodes: m}
+	return &node{isLeaf: false, inodes: inodes}
 }
 
 // --- helpers ---
@@ -63,161 +53,75 @@ func assertCheckErrContaining(t *testing.T, errs []error, substr string) {
 // --- Level B: per-bucket tree ---
 
 func TestCheck_BucketWellFormed(t *testing.T) {
-	// Two-level tree: root branch -> two leaves.
-	left := leafSn(2, [2]string{"a", "1"}, [2]string{"b", "2"}, [2]string{"c", "3"})
-	right := leafSn(3, [2]string{"m", "4"}, [2]string{"z", "5"})
-	root := branchSn(1, left, right)
-	bs := bucketStateFrom(1, root, left, right)
+	left := leafNode([2]string{"a", "1"}, [2]string{"b", "2"}, [2]string{"c", "3"})
+	right := leafNode([2]string{"m", "4"}, [2]string{"z", "5"})
+	root := branchNode(left, right)
+	bs := &bucketState{root: root}
 	assertNoCheckErrs(t, checkBucket("b", bs, newCheckConfig(nil)))
 }
 
 func TestCheck_BucketSingleLeafRoot(t *testing.T) {
-	n := leafSn(1, [2]string{"a", "1"}, [2]string{"b", "2"})
-	bs := bucketStateFrom(1, n)
+	bs := &bucketState{root: leafNode([2]string{"a", "1"}, [2]string{"b", "2"})}
 	assertNoCheckErrs(t, checkBucket("b", bs, newCheckConfig(nil)))
 }
 
 func TestCheck_BucketEmptyRoot(t *testing.T) {
-	// A bucket emptied of all keys keeps a leaf root with zero inodes.
-	n := &snapNode{nid: 1, isLeaf: true}
-	bs := bucketStateFrom(1, n)
+	// A bucket emptied of all keys has a nil published root.
+	bs := &bucketState{root: nil}
 	assertNoCheckErrs(t, checkBucket("b", bs, newCheckConfig(nil)))
 }
 
 func TestCheck_DanglingChild(t *testing.T) {
-	root := &snapNode{nid: 1, isLeaf: false, inodes: []common.Inode{
-		common.NewInode(0, 99, []byte("a"), nil), // child 99 absent
-	}}
-	bs := bucketStateFrom(1, root)
-	assertCheckErrContaining(t, checkBucket("b", bs, newCheckConfig(nil)), "missing child")
-}
-
-func TestCheck_OrphanNode(t *testing.T) {
-	left := leafSn(2, [2]string{"a", "1"})
-	root := branchSn(1, left)
-	orphan := leafSn(7, [2]string{"x", "9"}) // unreachable
-	bs := bucketStateFrom(1, root, left, orphan)
-	assertCheckErrContaining(t, checkBucket("b", bs, newCheckConfig(nil)), "unreachable")
+	// A branch inode with no child pointer.
+	root := &node{isLeaf: false, inodes: []inode{{key: []byte("a"), child: nil}}}
+	bs := &bucketState{root: root}
+	assertCheckErrContaining(t, checkBucket("b", bs, newCheckConfig(nil)), "nil child")
 }
 
 func TestCheck_CycleSharedChild(t *testing.T) {
-	// Root points at itself: the node is reachable via two "parents".
-	root := &snapNode{nid: 1, isLeaf: false, inodes: []common.Inode{
-		common.NewInode(0, 1, []byte("a"), nil),
-	}}
-	bs := bucketStateFrom(1, root)
+	// Root points at itself: the node is reachable via two parents.
+	root := &node{isLeaf: false, inodes: []inode{{key: []byte("a"), child: nil}}}
+	root.inodes[0].child = root // cycle
+	bs := &bucketState{root: root}
 	assertCheckErrContaining(t, checkBucket("b", bs, newCheckConfig(nil)), "multiple parents")
 }
 
 func TestCheck_UnsortedKeys(t *testing.T) {
-	n := leafSn(1, [2]string{"a", "1"}, [2]string{"c", "3"}, [2]string{"b", "2"})
-	bs := bucketStateFrom(1, n)
+	bs := &bucketState{root: leafNode([2]string{"a", "1"}, [2]string{"c", "3"}, [2]string{"b", "2"})}
 	assertCheckErrContaining(t, checkBucket("b", bs, newCheckConfig(nil)), "not strictly ascending")
 }
 
 func TestCheck_SeparatorMismatch(t *testing.T) {
-	child := leafSn(2, [2]string{"a", "1"})
-	root := &snapNode{nid: 1, isLeaf: false, inodes: []common.Inode{
-		common.NewInode(0, 2, []byte("WRONG"), nil), // separator != child first key "a"
-	}}
-	bs := bucketStateFrom(1, root, child)
+	child := leafNode([2]string{"a", "1"})
+	root := &node{isLeaf: false, inodes: []inode{{key: []byte("WRONG"), child: child}}}
+	bs := &bucketState{root: root}
 	assertCheckErrContaining(t, checkBucket("b", bs, newCheckConfig(nil)), "separator")
 }
 
-func TestCheck_LeafInodeWithChildNid(t *testing.T) {
-	n := &snapNode{nid: 1, isLeaf: true, inodes: []common.Inode{
-		common.NewInode(0, 5, []byte("a"), []byte("1")), // leaf inode carrying a child nid
-	}}
-	bs := bucketStateFrom(1, n)
-	assertCheckErrContaining(t, checkBucket("b", bs, newCheckConfig(nil)), "non-zero child nid")
+func TestCheck_LeafInodeWithChild(t *testing.T) {
+	other := leafNode([2]string{"x", "9"})
+	n := &node{isLeaf: true, inodes: []inode{{key: []byte("a"), value: []byte("1"), child: other}}}
+	bs := &bucketState{root: n}
+	assertCheckErrContaining(t, checkBucket("b", bs, newCheckConfig(nil)), "non-nil child")
 }
 
-func TestCheck_BranchInodeWithZeroNid(t *testing.T) {
-	n := &snapNode{nid: 1, isLeaf: false, inodes: []common.Inode{
-		common.NewInode(0, 0, []byte("a"), nil), // branch inode with no child pointer
-	}}
-	bs := bucketStateFrom(1, n)
-	assertCheckErrContaining(t, checkBucket("b", bs, newCheckConfig(nil)), "zero child nid")
+func TestCheck_BranchInodeWithValue(t *testing.T) {
+	child := leafNode([2]string{"a", "1"})
+	root := &node{isLeaf: false, inodes: []inode{{key: []byte("a"), value: []byte("oops"), child: child}}}
+	bs := &bucketState{root: root}
+	assertCheckErrContaining(t, checkBucket("b", bs, newCheckConfig(nil)), "carries a value")
 }
 
-func TestCheck_RootMissingFromNodes(t *testing.T) {
-	bs := &bucketState{root: 1, nodes: map[common.Nid]*snapNode{}}
-	assertCheckErrContaining(t, checkBucket("b", bs, newCheckConfig(nil)), "root nid")
-}
-
-func TestCheck_EmptyBucketWithOrphanNodes(t *testing.T) {
-	n := leafSn(1, [2]string{"a", "1"})
-	bs := &bucketState{root: 0, nodes: map[common.Nid]*snapNode{1: n}}
-	assertCheckErrContaining(t, checkBucket("b", bs, newCheckConfig(nil)), "orphan nodes")
-}
-
-func TestCheck_NodeSelfNidMismatch(t *testing.T) {
-	// Node keyed by 9 in the map but its self.nid is 2. This invariant is
-	// validated at Level A (checkDBState), which scans every bucket's nodes.
-	n := leafSn(2, [2]string{"a", "1"})
-	bs := &bucketState{root: 9, nodes: map[common.Nid]*snapNode{9: n}}
-	s := &dbState{
-		buckets: map[string]*bucketState{"x": bs},
-		nextNid: 10,
-	}
-	assertCheckErrContaining(t, checkDBState(s), "self.nid")
-}
-
-// --- Level A: dbState / global nid allocator ---
+// --- Level A: dbState ---
 
 func TestCheck_DBStateWellFormed(t *testing.T) {
-	left := leafSn(2, [2]string{"a", "1"})
-	root := branchSn(1, left)
-	bs := bucketStateFrom(1, root, left)
-	s := &dbState{
-		buckets: map[string]*bucketState{"x": bs},
-		nextNid: 3,
-	}
+	left := leafNode([2]string{"a", "1"})
+	bs := &bucketState{root: branchNode(left)}
+	s := &dbState{buckets: map[string]*bucketState{"x": bs}}
 	assertNoCheckErrs(t, checkDBState(s))
 }
 
-func TestCheck_DuplicateNidAcrossBuckets(t *testing.T) {
-	b1 := bucketStateFrom(2, leafSn(2, [2]string{"a", "1"}))
-	b2 := bucketStateFrom(2, leafSn(2, [2]string{"z", "9"})) // same nid 2
-	s := &dbState{
-		buckets: map[string]*bucketState{"x": b1, "y": b2},
-		nextNid: 10,
-	}
-	assertCheckErrContaining(t, checkDBState(s), "owned by two buckets")
-}
-
-func TestCheck_FreeNidLive(t *testing.T) {
-	bs := bucketStateFrom(2, leafSn(2, [2]string{"a", "1"}))
-	s := &dbState{
-		buckets: map[string]*bucketState{"x": bs},
-		nextNid: 10,
-		freeNid: []common.Nid{2}, // 2 is live
-	}
-	assertCheckErrContaining(t, checkDBState(s), "both free and live")
-}
-
-func TestCheck_NextNidHighWater(t *testing.T) {
-	bs := bucketStateFrom(5, leafSn(5, [2]string{"a", "1"}))
-	s := &dbState{
-		buckets: map[string]*bucketState{"x": bs},
-		nextNid: 5, // live nid 5 >= nextNid 5
-	}
-	assertCheckErrContaining(t, checkDBState(s), ">= nextNid")
-}
-
-func TestCheck_DuplicateFreeNid(t *testing.T) {
-	s := &dbState{
-		buckets: map[string]*bucketState{},
-		nextNid: 10,
-		freeNid: []common.Nid{3, 3},
-	}
-	assertCheckErrContaining(t, checkDBState(s), "duplicate free nid")
-}
-
 func TestCheck_NilBucketState(t *testing.T) {
-	s := &dbState{
-		buckets: map[string]*bucketState{"x": nil},
-		nextNid: 1,
-	}
+	s := &dbState{buckets: map[string]*bucketState{"x": nil}}
 	assertCheckErrContaining(t, checkDBState(s), "nil state")
 }

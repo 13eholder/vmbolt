@@ -2,10 +2,8 @@ package vmbolt
 
 import (
 	"bytes"
-	"fmt"
 
 	"github.com/13eholder/vmbolt/errors"
-	"github.com/13eholder/vmbolt/internal/common"
 )
 
 const (
@@ -30,30 +28,89 @@ type Bucket struct {
 	tx   *Tx
 	name string
 
-	base     *bucketState             // pinned generation: read view / COW base (nil for a brand-new bucket)
-	rootNode *workNode                // materialized mutable root (nil until first write)
-	dirty    map[common.Nid]*workNode // tx-local mutable node cache (write tx only)
-	obsolete map[common.Nid]struct{}  // node ids freed in this tx (write tx only)
+	rootNode *node          // materialized mutable root (nil until first write)
+	dirty    map[*node]bool // set of nodes copied/created in this tx (write tx only)
 
 	// FillPercent sets the threshold for filling nodes when they split. It is
 	// non-persisted and must be set per tx.
 	FillPercent float64
 }
 
-// newBucket creates a tx-local Bucket bound to an existing committed bucket
-// state or a brand-new bucket when base is nil.
-func newBucket(tx *Tx, name string, base *bucketState) *Bucket {
+// newBucket creates a tx-local Bucket bound to a top-level bucket name. The
+// committed state is resolved on demand from the tx's pinned dbState.
+func newBucket(tx *Tx, name string) *Bucket {
 	b := &Bucket{
 		tx:          tx,
 		name:        name,
-		base:        base,
 		FillPercent: DefaultFillPercent,
 	}
 	if tx.writable {
-		b.dirty = make(map[common.Nid]*workNode)
-		b.obsolete = make(map[common.Nid]struct{})
+		b.dirty = make(map[*node]bool)
 	}
 	return b
+}
+
+// baseState returns the committed bucketState this bucket was opened against, or nil.
+func (b *Bucket) baseState() *bucketState {
+	if b.tx == nil || b.tx.base == nil {
+		return nil
+	}
+	return b.tx.base.buckets[b.name]
+}
+
+// rootView returns the root node for read access: the materialized mutable root
+// if this write tx has one (read-your-own-writes), otherwise the published root.
+func (b *Bucket) rootView() *node {
+	if b.rootNode != nil {
+		return b.rootNode
+	}
+	if bs := b.baseState(); bs != nil {
+		return bs.root
+	}
+	return nil
+}
+
+// writableRoot returns the root node for write access, materializing (COW) the
+// published root on first write.
+func (b *Bucket) writableRoot() *node {
+	if b.rootNode != nil {
+		return b.rootNode
+	}
+	var root *node
+	if bs := b.baseState(); bs != nil && bs.root != nil {
+		root = b.copyNode(bs.root)
+	} else {
+		root = &node{bucket: b, isLeaf: true}
+	}
+	b.dirty[root] = true
+	b.rootNode = root
+	return root
+}
+
+// copyNode returns a mutable shallow copy of a published (immutable) node: the
+// inode slice is copied (so entries can be rebound) but child pointers still
+// reference the original children, which are materialized lazily on write.
+func (b *Bucket) copyNode(orig *node) *node {
+	return &node{
+		bucket: b,
+		isLeaf: orig.isLeaf,
+		key:    orig.key,
+		inodes: append([]inode(nil), orig.inodes...),
+	}
+}
+
+// childForWrite returns the child of parent at idx for write access, COW-ing
+// the child into this tx on first touch and relinking the parent's inode at it.
+func (b *Bucket) childForWrite(parent *node, idx int) *node {
+	child := parent.inodes[idx].child
+	if b.dirty[child] {
+		return child // already copied in this tx
+	}
+	c := b.copyNode(child)
+	c.parent = parent
+	b.dirty[c] = true
+	parent.inodes[idx].child = c
+	return c
 }
 
 // Tx returns the tx of the bucket.
@@ -64,18 +121,6 @@ func (b *Bucket) Tx() *Tx {
 // Name returns the bucket's name.
 func (b *Bucket) Name() string {
 	return b.name
-}
-
-// Root returns the Nid of the bucket's root node. Returns 0 if the bucket has
-// no committed root and none has been materialized yet.
-func (b *Bucket) Root() common.Nid {
-	if b.rootNode != nil {
-		return b.rootNode.nid
-	}
-	if b.base != nil {
-		return b.base.root
-	}
-	return 0
 }
 
 // Writable returns whether the bucket is writable.
@@ -120,7 +165,7 @@ func (b *Bucket) Put(key []byte, value []byte) (err error) {
 
 	c := b.Cursor()
 	c.seek(newKey)
-	c.node().put(newKey, newKey, newValue, 0, 0)
+	c.node().put(newKey, newKey, newValue, nil, 0)
 
 	return nil
 }
@@ -178,14 +223,14 @@ func (b *Bucket) Stats() BucketStats {
 		if n.isLeaf {
 			s.KeyN += len(n.inodes)
 			used := uintptr(nodeHeaderOverheadBytes)
-			for _, inode := range n.inodes {
-				used += uintptr(nodeInodeOverheadBytes) + uintptr(len(inode.Key())) + uintptr(len(inode.Value()))
+			for i := range n.inodes {
+				used += uintptr(nodeInodeOverheadBytes) + uintptr(len(n.inodes[i].key)) + uintptr(len(n.inodes[i].value))
 			}
 			s.LeafInuse += int(used)
 		} else {
 			used := uintptr(nodeHeaderOverheadBytes)
-			for _, inode := range n.inodes {
-				used += uintptr(nodeInodeOverheadBytes) + uintptr(len(inode.Key()))
+			for i := range n.inodes {
+				used += uintptr(nodeInodeOverheadBytes) + uintptr(len(n.inodes[i].key))
 			}
 			s.BranchInuse += int(used)
 		}
@@ -196,123 +241,25 @@ func (b *Bucket) Stats() BucketStats {
 	return s
 }
 
-// forEachNode iterates over every node in a bucket.
+// forEachNode iterates over every node in a bucket's current view.
 func (b *Bucket) forEachNode(fn func(*node, int)) {
-	if b.rootNode != nil && b.Root() == 0 {
-		fn(b.rootNode.readNodeView(), 0)
+	root := b.rootView()
+	if root == nil {
 		return
 	}
-	if !b.hasCommittedRoot() {
-		return
-	}
-	b._forEachNode(b.Root(), 0, fn)
+	b.forEachNodeDFS(root, 0, fn)
 }
 
-func (b *Bucket) _forEachNode(nid common.Nid, depth int, fn func(*node, int)) {
-	n := b.pageNode(nid)
-	if n == nil {
-		return
-	}
+func (b *Bucket) forEachNodeDFS(n *node, depth int, fn func(*node, int)) {
 	fn(n, depth)
 	if !n.isLeaf {
-		for _, inode := range n.inodes {
-			b._forEachNode(inode.Nid(), depth+1, fn)
+		for i := range n.inodes {
+			b.forEachNodeDFS(n.inodes[i].child, depth+1, fn)
 		}
 	}
 }
 
-// hasCommittedRoot reports whether the bucket has a published root node.
-func (b *Bucket) hasCommittedRoot() bool {
-	return b.base != nil && b.base.root != 0
-}
-
-// node returns a writable node for the given id, materializing one (COW) if
-// necessary. This is the write-path entry; the read path uses pageNode.
-func (b *Bucket) node(id common.Nid, parent *workNode) *workNode {
-	common.Assert(b.dirty != nil, "nodes map expected (write tx)")
-
-	if n := b.dirty[id]; n != nil {
-		return n
-	}
-
-	var n *workNode
-	if !b.hasCommittedRoot() {
-		// No committed root yet: use/create the in-memory root (id 0 placeholder).
-		if b.rootNode != nil {
-			n = b.rootNode
-		} else {
-			n = &workNode{bucket: b, isLeaf: true}
-		}
-		n.parent = parent
-	} else {
-		n = b.nodeForWrite(id, parent)
-	}
-
-	if parent == nil {
-		b.rootNode = n
-	}
-	b.dirty[id] = n
-	b.tx.stats.IncNodeCount(1)
-	return n
-}
-
-// nodeForWrite returns a writable copy of a node (COW from the base snapshot).
-func (b *Bucket) nodeForWrite(id common.Nid, parent *workNode) *workNode {
-	if n, ok := b.dirty[id]; ok {
-		return n
-	}
-	if _, ok := b.obsolete[id]; ok {
-		panic(fmt.Sprintf("node %d has been removed", id))
-	}
-	var orig *snapNode
-	if b.base != nil {
-		orig = b.base.nodes[id]
-	}
-	if orig == nil {
-		panic(fmt.Sprintf("node %d not found", id))
-	}
-	n := orig.materializeWorkNode()
-	n.parent = parent
-	n.bucket = b
-	n.children = nil
-	n.spilled = false
-	n.unbalanced = false
-	b.dirty[id] = n
-	if parent != nil {
-		parent.children = append(parent.children, n)
-	}
-	return n
-}
-
-// pageNode returns a read-only node view (*snapNode) for a logical node id.
-// When a bucket has a materialized but unfinalized root, id 0 (and the root's
-// id) map to that in-memory root.
-func (b *Bucket) pageNode(id common.Nid) *node {
-	if b.rootNode != nil && (id == 0 || id == b.rootNode.nid) {
-		return b.rootNode.readNodeView()
-	}
-	if b.dirty != nil {
-		if n := b.dirty[id]; n != nil {
-			return n.readNodeView()
-		}
-	}
-	if b.obsolete != nil {
-		if _, ok := b.obsolete[id]; ok {
-			return nil
-		}
-	}
-	if b.base != nil {
-		return b.base.nodes[id]
-	}
-	return nil
-}
-
-// allocate returns a new node id for this bucket, reusing freed ids first.
-func (b *Bucket) allocate() (common.Nid, error) {
-	return b.tx.allocateNid(), nil
-}
-
-// spill finalizes the bucket's dirty tree (split + assign node ids).
+// spill finalizes the bucket's dirty tree (split + wire parent pointers).
 func (b *Bucket) spill() error {
 	if b.rootNode == nil {
 		return nil
@@ -324,88 +271,42 @@ func (b *Bucket) spill() error {
 	return nil
 }
 
-// rebalance rebalances every dirty node in the bucket.
+// rebalance rebalances every node touched in this tx.
 func (b *Bucket) rebalance() {
-	for _, n := range b.dirty {
+	for n := range b.dirty {
 		n.rebalance()
 	}
 }
 
-// markObsolete records that a node id is freed in this tx. Idempotent.
-func (b *Bucket) markObsolete(id common.Nid) {
-	if b.obsolete == nil {
-		return
+// publishRoot assembles the immutable bucketState to publish for this bucket.
+// If the bucket was not written, the existing state is reused; otherwise the
+// materialized root (now immutable by convention) is published. Publishing is
+// O(1): a new root pointer, with unchanged subtrees shared by pointer.
+func (b *Bucket) publishRoot() *bucketState {
+	if b.rootNode == nil {
+		return b.baseState()
 	}
-	if _, ok := b.obsolete[id]; ok {
-		return
-	}
-	b.obsolete[id] = struct{}{}
-	b.tx.freeNid(id)
-}
-
-// dropNode removes a node from the tx-local dirty cache and marks it obsolete.
-func (b *Bucket) dropNode(id common.Nid) {
-	delete(b.dirty, id)
-	b.markObsolete(id)
-}
-
-// buildPublishedState assembles the immutable bucketState to publish for this
-// bucket from its COW base plus frozen dirty workNodes. Clean (unchanged) nodes
-// are shared by pointer; only dirtied/obsolete entries differ.
-func (b *Bucket) buildPublishedState() *bucketState {
-	var baseNodes map[common.Nid]*snapNode
-	rootNid := common.Nid(0)
-	if b.base != nil {
-		baseNodes = b.base.nodes
-		rootNid = b.base.root
-	}
-
-	var newNodes map[common.Nid]*snapNode
-	if len(b.dirty) == 0 && len(b.obsolete) == 0 {
-		newNodes = baseNodes
-	} else {
-		newNodes = make(map[common.Nid]*snapNode, len(baseNodes)+len(b.dirty))
-		for nid, n := range baseNodes {
-			newNodes[nid] = n
-		}
-		for nid := range b.obsolete {
-			delete(newNodes, nid)
-		}
-		for nid, n := range b.dirty {
-			newNodes[nid] = n.freeze()
-		}
-	}
-
-	if b.rootNode != nil {
-		rootNid = b.rootNode.nid
-	}
-
-	return &bucketState{
-		root:  rootNid,
-		nodes: newNodes,
-	}
+	return &bucketState{root: b.rootNode}
 }
 
 // size returns the logical payload size of the bucket's tx view in bytes.
 func (b *Bucket) size() int64 {
-	var size int64
-	var baseNodes map[common.Nid]*snapNode
-	if b.base != nil {
-		baseNodes = b.base.nodes
+	root := b.rootView()
+	if root == nil {
+		return 0
 	}
-	for id, n := range baseNodes {
-		if _, ok := b.obsolete[id]; ok {
-			continue
+	var sz int64
+	var walk func(n *node)
+	walk = func(n *node) {
+		sz += int64(n.size())
+		if !n.isLeaf {
+			for i := range n.inodes {
+				walk(n.inodes[i].child)
+			}
 		}
-		if _, ok := b.dirty[id]; ok {
-			continue
-		}
-		size += int64(n.size())
 	}
-	for _, n := range b.dirty {
-		size += int64(n.size())
-	}
-	return size
+	walk(root)
+	return sz
 }
 
 // BucketStats records statistics about resources used by a bucket.

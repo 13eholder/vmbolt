@@ -6,14 +6,11 @@ import (
 	"fmt"
 	"sort"
 	"sync"
-
-	"github.com/13eholder/vmbolt/internal/common"
 )
 
 // Check performs structural consistency validation of the committed database
-// snapshot pinned by this transaction (tx.base). It is the page-less analogue
-// of bbolt's tx.Check: instead of validating physical pages it validates the
-// immutable in-memory node graph.
+// snapshot pinned by this transaction (tx.base). It validates the immutable
+// in-memory node graph directly via child pointers (no flat index).
 //
 // Every detected inconsistency is streamed on the returned channel; the
 // channel is closed when validation completes. A well-formed database yields
@@ -40,7 +37,7 @@ func (tx *Tx) Check(options ...CheckOption) <-chan error {
 			return
 		}
 
-		// Level A: dbState / global nid allocator (serial).
+		// Level A: dbState consistency (serial).
 		for _, err := range checkDBState(tx.base) {
 			ch <- err
 		}
@@ -71,119 +68,45 @@ func sortedBucketNames(buckets map[string]*bucketState) []string {
 }
 
 // ===========================================================================================
-// Level A — dbState / global nid allocator
-//
+// Level A — dbState consistency
+
 // checkDBState validates the global, cross-bucket invariants of a published
-// dbState: bucket presence, node-key/self-nid agreement, the nextNid
-// high-water mark, and freelist disjointness from live ids plus global nid
-// uniqueness.
+// dbState: every published bucket state is non-nil.
 func checkDBState(s *dbState) []error {
 	if s == nil {
 		return []error{fmt.Errorf("vmbolt: check: nil dbState")}
 	}
 	var errs []error
-
-	// Collect live nids across all buckets; assert global uniqueness and that
-	// the map key matches each node's self-nid.
-	live := make(map[common.Nid]string, estimateLiveNids(s))
 	for name, bs := range s.buckets {
 		if bs == nil {
 			errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q has nil state", name))
-			continue
-		}
-		for nid, n := range bs.nodes {
-			if n == nil {
-				errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q node nid %d is nil", name, nid))
-				continue
-			}
-			if n.nid != nid {
-				errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q node keyed by nid %d but self.nid=%d", name, nid, n.nid))
-			}
-			if owner, dup := live[nid]; dup {
-				errs = append(errs, fmt.Errorf("vmbolt: check: nid %d owned by two buckets: %q and %q", nid, owner, name))
-			} else {
-				live[nid] = name
-			}
 		}
 	}
-
-	// nextNid is the high-water mark: every live id must be 0 < id < nextNid.
-	for nid, owner := range live {
-		if nid == 0 {
-			errs = append(errs, fmt.Errorf("vmbolt: check: reserved nid 0 is live in bucket %q", owner))
-		}
-		if uint64(nid) >= s.nextNid {
-			errs = append(errs, fmt.Errorf("vmbolt: check: live nid %d >= nextNid %d (bucket %q)", nid, s.nextNid, owner))
-		}
-	}
-
-	// Freelist: entries must be below nextNid, unique, and disjoint from live ids.
-	seen := make(map[common.Nid]struct{}, len(s.freeNid))
-	for _, nid := range s.freeNid {
-		if nid == 0 {
-			errs = append(errs, fmt.Errorf("vmbolt: check: reserved nid 0 present in freelist"))
-			continue
-		}
-		if uint64(nid) >= s.nextNid {
-			errs = append(errs, fmt.Errorf("vmbolt: check: free nid %d >= nextNid %d", nid, s.nextNid))
-		}
-		if _, dup := seen[nid]; dup {
-			errs = append(errs, fmt.Errorf("vmbolt: check: duplicate free nid %d", nid))
-		} else {
-			seen[nid] = struct{}{}
-		}
-		if owner, isLive := live[nid]; isLive {
-			errs = append(errs, fmt.Errorf("vmbolt: check: nid %d is both free and live (bucket %q)", nid, owner))
-		}
-	}
-
 	return errs
-}
-
-func estimateLiveNids(s *dbState) int {
-	n := 0
-	for _, bs := range s.buckets {
-		if bs != nil {
-			n += len(bs.nodes)
-		}
-	}
-	return n
 }
 
 // ===========================================================================================
 // Level B — per-bucket B+tree
 //
-// checkBucket validates one bucket's immutable snapNode graph:
-//   - root presence (root 0 == empty bucket with no nodes),
-//   - reachability from root (no dangling child pointers, no cycles / shared
-//     children),
-//   - no orphan nodes (every node reachable),
-//   - strictly ascending keys per node,
-//   - leaf/branch inode shape consistency,
-//   - the branch separator invariant (parent separator == child's first key).
+// checkBucket validates one bucket's published node tree: root presence,
+// reachability from root (no nil/dangling child, no cycle / shared child within
+// this single tree), strictly ascending keys per node, leaf/branch inode shape
+// consistency, and the branch separator invariant (parent separator == child's
+// first key). Cross-generation subtree sharing is legitimate; the visited set
+// is therefore keyed by pointer identity and only flags a repeat within a
+// single tree walk.
 func checkBucket(name string, bs *bucketState, cfg *checkConfig) []error {
 	if bs == nil {
 		return []error{fmt.Errorf("vmbolt: check: bucket %q has nil state", name)}
 	}
 	var errs []error
 	ks := cfg.kvStringer
-
-	// Empty bucket: root 0, no nodes.
-	if bs.root == 0 {
-		if len(bs.nodes) != 0 {
-			errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q has root 0 but %d orphan nodes", name, len(bs.nodes)))
-		}
-		return errs
+	if bs.root == nil {
+		return errs // empty bucket
 	}
 
-	root, ok := bs.nodes[bs.root]
-	if !ok || root == nil {
-		return append(errs, fmt.Errorf("vmbolt: check: bucket %q root nid %d not in nodes map", name, bs.root))
-	}
-
-	// Iterative reachability walk from root.
-	visited := make(map[common.Nid]bool, len(bs.nodes))
-	stack := []*snapNode{root}
+	visited := make(map[*node]bool)
+	stack := []*node{bs.root}
 	for len(stack) > 0 {
 		n := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
@@ -191,44 +114,31 @@ func checkBucket(name string, bs *bucketState, cfg *checkConfig) []error {
 			errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q encountered nil node during walk", name))
 			continue
 		}
-		if visited[n.nid] {
-			errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q node nid %d reachable via multiple parents (cycle or shared child)", name, n.nid))
+		if visited[n] {
+			errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q node %p reachable via multiple parents (cycle or shared child)", name, n))
 			continue
 		}
-		visited[n.nid] = true
+		visited[n] = true
 
-		// Intra-node invariants.
 		errs = append(errs, checkNode(name, n, ks)...)
 
-		// Branch: validate each child pointer + separator invariant.
 		if !n.isLeaf {
 			for i := range n.inodes {
-				inode := &n.inodes[i]
-				cid := inode.Nid()
-				child, ok := bs.nodes[cid]
-				if !ok || child == nil {
-					errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q branch nid %d points to missing child nid %d", name, n.nid, cid))
+				child := n.inodes[i].child
+				if child == nil {
+					errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q branch node %p inode %d has nil child", name, n, i))
 					continue
 				}
 				if len(child.inodes) == 0 {
-					errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q child nid %d has no inodes (parent nid %d, sep %q)", name, cid, n.nid, ks.KeyToString(inode.Key())))
-					visited[cid] = true // not pushed; suppress a duplicate orphan report
+					errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q child %p has no inodes (parent %p, sep %q)", name, child, n, ks.KeyToString(n.inodes[i].key)))
 					continue
 				}
-				// Separator invariant: the parent entry key must equal the child's first key.
-				if !bytes.Equal(inode.Key(), child.inodes[0].Key()) {
-					errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q branch nid %d separator %q != child nid %d first key %q",
-						name, n.nid, ks.KeyToString(inode.Key()), cid, ks.KeyToString(child.inodes[0].Key())))
+				if !bytes.Equal(n.inodes[i].key, child.inodes[0].key) {
+					errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q branch separator %q != child %p first key %q",
+						name, ks.KeyToString(n.inodes[i].key), child, ks.KeyToString(child.inodes[0].key)))
 				}
 				stack = append(stack, child)
 			}
-		}
-	}
-
-	// Orphan check: every node must be reachable from root.
-	for nid := range bs.nodes {
-		if !visited[nid] {
-			errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q node nid %d is unreachable from root (orphan)", name, nid))
 		}
 	}
 
@@ -236,38 +146,33 @@ func checkBucket(name string, bs *bucketState, cfg *checkConfig) []error {
 }
 
 // checkNode validates intra-node invariants: strictly ascending, non-empty
-// keys and leaf/branch inode shape consistency. An empty node is allowed here
-// (the caller reports empty non-root children).
-func checkNode(name string, n *snapNode, ks KVStringer) []error {
+// keys and leaf/branch inode shape consistency.
+func checkNode(name string, n *node, ks KVStringer) []error {
 	var errs []error
-	if len(n.inodes) == 0 {
-		return errs
-	}
-	prev := n.inodes[0].Key()
-	for i := 0; i < len(n.inodes); i++ {
-		inode := &n.inodes[i]
-		if len(inode.Key()) == 0 {
-			errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q node nid %d has empty key at index %d", name, n.nid, i))
+	var prev []byte
+	for i := range n.inodes {
+		in := &n.inodes[i]
+		if len(in.key) == 0 {
+			errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q node %p has empty key at index %d", name, n, i))
 		}
 		if i > 0 {
-			if bytes.Compare(inode.Key(), prev) <= 0 {
-				errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q node nid %d keys not strictly ascending at index %d (%q <= %q)",
-					name, n.nid, i, ks.KeyToString(prev), ks.KeyToString(inode.Key())))
+			if bytes.Compare(in.key, prev) <= 0 {
+				errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q node %p keys not strictly ascending at index %d (%q <= %q)",
+					name, n, i, ks.KeyToString(prev), ks.KeyToString(in.key)))
 			}
-			prev = inode.Key()
 		}
+		prev = in.key
 		// Shape consistency.
 		if n.isLeaf {
-			if inode.Nid() != 0 {
-				errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q leaf node nid %d inode %d has non-zero child nid %d", name, n.nid, i, inode.Nid()))
+			if in.child != nil {
+				errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q leaf node %p inode %d has a non-nil child", name, n, i))
 			}
 		} else {
-			// Branch inode: must carry a child pointer and no value.
-			if inode.Nid() == 0 {
-				errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q branch node nid %d inode %d has zero child nid", name, n.nid, i))
+			if in.child == nil {
+				errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q branch node %p inode %d has nil child", name, n, i))
 			}
-			if len(inode.Value()) != 0 {
-				errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q branch node nid %d inode %d carries a value", name, n.nid, i))
+			if len(in.value) != 0 {
+				errs = append(errs, fmt.Errorf("vmbolt: check: bucket %q branch node %p inode %d carries a value", name, n, i))
 			}
 		}
 	}

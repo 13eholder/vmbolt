@@ -17,7 +17,7 @@ const (
 )
 
 // root returns the top-level node this node is attached to.
-func (n *workNode) root() *workNode {
+func (n *node) root() *node {
 	if n.parent == nil {
 		return n
 	}
@@ -25,7 +25,7 @@ func (n *workNode) root() *workNode {
 }
 
 // minKeys returns the minimum number of inodes this node should have.
-func (n *workNode) minKeys() int {
+func (n *node) minKeys() int {
 	if n.isLeaf {
 		return 1
 	}
@@ -33,21 +33,21 @@ func (n *workNode) minKeys() int {
 }
 
 // size returns the serialized size of the node (used for split threshold).
-func (n *workNode) size() int {
+func (n *node) size() int {
 	sz := nodeHeaderOverheadBytes
 	for i := 0; i < len(n.inodes); i++ {
 		item := &n.inodes[i]
-		sz += nodeInodeOverheadBytes + len(item.Key()) + len(item.Value())
+		sz += nodeInodeOverheadBytes + len(item.key) + len(item.value)
 	}
 	return sz
 }
 
 // sizeLessThan returns true if the node is less than a given size.
-func (n *workNode) sizeLessThan(v int) bool {
+func (n *node) sizeLessThan(v int) bool {
 	sz := nodeHeaderOverheadBytes
 	for i := 0; i < len(n.inodes); i++ {
 		item := &n.inodes[i]
-		sz += nodeInodeOverheadBytes + len(item.Key()) + len(item.Value())
+		sz += nodeInodeOverheadBytes + len(item.key) + len(item.value)
 		if sz >= v {
 			return false
 		}
@@ -55,27 +55,27 @@ func (n *workNode) sizeLessThan(v int) bool {
 	return true
 }
 
-// childAt returns the child node at a given index.
-func (n *workNode) childAt(index int) *workNode {
+// childAt returns the child node at a given index, materializing (COW) the
+// child into this write transaction if it is still a published (immutable) node.
+func (n *node) childAt(index int) *node {
 	if n.isLeaf {
 		panic(fmt.Sprintf("invalid childAt(%d) on a leaf node", index))
 	}
-	return n.bucket.node(n.inodes[index].Nid(), n)
+	return n.bucket.childForWrite(n, index)
 }
 
 // childIndex returns the index of a given child node.
-func (n *workNode) childIndex(child *workNode) int {
-	index := sort.Search(len(n.inodes), func(i int) bool { return bytes.Compare(n.inodes[i].Key(), child.key) != -1 })
-	return index
+func (n *node) childIndex(child *node) int {
+	return sort.Search(len(n.inodes), func(i int) bool { return bytes.Compare(n.inodes[i].key, child.key) != -1 })
 }
 
 // numChildren returns the number of children.
-func (n *workNode) numChildren() int {
+func (n *node) numChildren() int {
 	return len(n.inodes)
 }
 
 // nextSibling returns the next node with the same parent.
-func (n *workNode) nextSibling() *workNode {
+func (n *node) nextSibling() *node {
 	if n.parent == nil {
 		return nil
 	}
@@ -87,7 +87,7 @@ func (n *workNode) nextSibling() *workNode {
 }
 
 // prevSibling returns the previous node with the same parent.
-func (n *workNode) prevSibling() *workNode {
+func (n *node) prevSibling() *node {
 	if n.parent == nil {
 		return nil
 	}
@@ -98,8 +98,8 @@ func (n *workNode) prevSibling() *workNode {
 	return n.parent.childAt(index - 1)
 }
 
-// put inserts a key/value.
-func (n *workNode) put(oldKey, newKey, value []byte, nId common.Nid, flags uint32) {
+// put inserts a key/value (leaf) or key/child (branch).
+func (n *node) put(oldKey, newKey, value []byte, child *node, flags uint32) {
 	if len(oldKey) <= 0 {
 		panic("put: zero-length old key")
 	} else if len(newKey) <= 0 {
@@ -107,30 +107,30 @@ func (n *workNode) put(oldKey, newKey, value []byte, nId common.Nid, flags uint3
 	}
 
 	// Find insertion index.
-	index := sort.Search(len(n.inodes), func(i int) bool { return bytes.Compare(n.inodes[i].Key(), oldKey) != -1 })
+	index := sort.Search(len(n.inodes), func(i int) bool { return bytes.Compare(n.inodes[i].key, oldKey) != -1 })
 
 	// Add capacity and shift nodes if we don't have an exact match and need to insert.
-	exact := len(n.inodes) > 0 && index < len(n.inodes) && bytes.Equal(n.inodes[index].Key(), oldKey)
+	exact := len(n.inodes) > 0 && index < len(n.inodes) && bytes.Equal(n.inodes[index].key, oldKey)
 	if !exact {
-		n.inodes = append(n.inodes, common.Inode{})
+		n.inodes = append(n.inodes, inode{})
 		copy(n.inodes[index+1:], n.inodes[index:])
 	}
 
 	inode := &n.inodes[index]
-	inode.SetFlags(flags)
-	inode.SetKey(newKey)
-	inode.SetValue(value)
-	inode.SetNid(nId)
-	common.Assert(len(inode.Key()) > 0, "put: zero-length inode key")
+	inode.flags = flags
+	inode.key = newKey
+	inode.value = value
+	inode.child = child
+	common.Assert(len(inode.key) > 0, "put: zero-length inode key")
 }
 
 // del removes a key from the node.
-func (n *workNode) del(key []byte) {
+func (n *node) del(key []byte) {
 	// Find index of key.
-	index := sort.Search(len(n.inodes), func(i int) bool { return bytes.Compare(n.inodes[i].Key(), key) != -1 })
+	index := sort.Search(len(n.inodes), func(i int) bool { return bytes.Compare(n.inodes[i].key, key) != -1 })
 
 	// Exit if the key isn't found.
-	if index >= len(n.inodes) || !bytes.Equal(n.inodes[index].Key(), key) {
+	if index >= len(n.inodes) || !bytes.Equal(n.inodes[index].key, key) {
 		return
 	}
 
@@ -143,8 +143,8 @@ func (n *workNode) del(key []byte) {
 
 // split breaks up a node into multiple smaller nodes, if appropriate.
 // This should only be called from the spill() function.
-func (n *workNode) split() []*workNode {
-	var nodes []*workNode
+func (n *node) split() []*node {
+	var nodes []*node
 
 	node := n
 	for {
@@ -166,7 +166,7 @@ func (n *workNode) split() []*workNode {
 
 // splitTwo breaks up a node into two smaller nodes, if appropriate.
 // This should only be called from the split() function.
-func (n *workNode) splitTwo() (*workNode, *workNode) {
+func (n *node) splitTwo() (*node, *node) {
 	// Ignore the split if the node doesn't have at least enough nodes for
 	// two nodes or if the nodes can fit in a single node.
 	if len(n.inodes) <= (minKeysPerNode*2) || n.sizeLessThan(defaultMaxNodeSizeBytes) {
@@ -188,12 +188,13 @@ func (n *workNode) splitTwo() (*workNode, *workNode) {
 	// Split node into two separate nodes.
 	// If there's no parent then we'll need to create one.
 	if n.parent == nil {
-		n.parent = &workNode{bucket: n.bucket, children: []*workNode{n}}
+		n.parent = &node{bucket: n.bucket}
+		n.bucket.dirty[n.parent] = true
 	}
 
 	// Create a new node and add it to the parent.
-	next := &workNode{bucket: n.bucket, isLeaf: n.isLeaf, parent: n.parent}
-	n.parent.children = append(n.parent.children, next)
+	next := &node{bucket: n.bucket, isLeaf: n.isLeaf, parent: n.parent}
+	n.bucket.dirty[next] = true
 
 	// Split inodes across two nodes.
 	next.inodes = n.inodes[splitIndex:]
@@ -208,14 +209,14 @@ func (n *workNode) splitTwo() (*workNode, *workNode) {
 // splitIndex finds the position where a node will fill a given threshold.
 // It returns the index as well as the size of the first node.
 // This is only be called from split().
-func (n *workNode) splitIndex(threshold int) (index, sz int) {
+func (n *node) splitIndex(threshold int) (index, sz int) {
 	sz = nodeHeaderOverheadBytes
 
 	// Loop until we only have the minimum number of keys required for the second node.
 	for i := 0; i < len(n.inodes)-minKeysPerNode; i++ {
 		index = i
 		inode := n.inodes[i]
-		elsize := nodeInodeOverheadBytes + len(inode.Key()) + len(inode.Value())
+		elsize := nodeInodeOverheadBytes + len(inode.key) + len(inode.value)
 
 		// If we have at least the minimum number of keys and adding another
 		// node would put us over the threshold then exit and return.
@@ -230,58 +231,46 @@ func (n *workNode) splitIndex(threshold int) (index, sz int) {
 	return
 }
 
-// finalize assigns logical ids to materialized nodes and updates parent links.
-func (n *workNode) finalize() error {
+// finalize spills the subtree under n: it recursively finalizes copied children,
+// splits oversize nodes, and wires parent inodes to point at the finalized
+// children. There are no node ids to assign; parent/child linkage is by pointer.
+func (n *node) finalize() error {
 	var tx = n.bucket.tx
 	if n.spilled {
 		return nil
 	}
 
-	// Spill child nodes first. Child nodes can materialize sibling nodes in
-	// the case of split-merge so we cannot use a range loop. We have to check
-	// the children size on every loop iteration.
-	sort.Sort(n.children)
-	for i := 0; i < len(n.children); i++ {
-		if err := n.children[i].finalize(); err != nil {
-			return err
+	// Spill copied children first (descend via inodes.child for nodes that this
+	// tx has materialized). Published (shared) children need no work.
+	for i := range n.inodes {
+		c := n.inodes[i].child
+		if c != nil && n.bucket.dirty[c] {
+			if err := c.finalize(); err != nil {
+				return err
+			}
 		}
 	}
-
-	// We no longer need the child list because it's only used for spill tracking.
-	n.children = nil
 
 	// Split nodes into appropriate sizes. The first node will always be n.
 	var nodes = n.split()
 	for _, node := range nodes {
-		if node.nid == 0 {
-			nid, err := n.bucket.allocate()
-			if err != nil {
-				return err
-			}
-			// The node was tracked under the placeholder key 0 (unfinalized
-			// root); move it to its real id so it is frozen exactly once.
-			delete(n.bucket.dirty, 0)
-			node.nid = nid
-		}
 		node.spilled = true
-
-		n.bucket.dirty[node.nid] = node
 
 		// Update the parent entry to point at the finalized child.
 		if node.parent != nil {
 			var key = node.key
 			if len(key) == 0 {
 				if len(node.inodes) == 0 {
-					panic(fmt.Sprintf("finalize: node %d has no inodes", node.nid))
+					panic("finalize: node has no inodes")
 				}
-				key = node.inodes[0].Key()
+				key = node.inodes[0].key
 			}
 			if len(key) == 0 {
-				panic(fmt.Sprintf("finalize: zero-length key for node %d, inodes=%d, isLeaf=%v", node.nid, len(node.inodes), node.isLeaf))
+				panic(fmt.Sprintf("finalize: zero-length key, inodes=%d, isLeaf=%v", len(node.inodes), node.isLeaf))
 			}
 
-			node.parent.put(key, node.inodes[0].Key(), nil, node.nid, 0)
-			node.key = node.inodes[0].Key()
+			node.parent.put(key, node.inodes[0].key, nil, node, 0)
+			node.key = node.inodes[0].key
 			common.Assert(len(node.key) > 0, "finalize: zero-length node key")
 		}
 
@@ -290,8 +279,7 @@ func (n *workNode) finalize() error {
 	}
 
 	// If the root node split and created a new root then finalize that as well.
-	if n.parent != nil && n.parent.nid == 0 {
-		n.children = nil
+	if n.parent != nil && !n.parent.spilled {
 		return n.parent.finalize()
 	}
 
@@ -300,7 +288,7 @@ func (n *workNode) finalize() error {
 
 // rebalance attempts to combine the node with sibling nodes if the node fill
 // size is below a threshold or if there are not enough keys.
-func (n *workNode) rebalance() {
+func (n *node) rebalance() {
 	if !n.unbalanced {
 		return
 	}
@@ -320,21 +308,19 @@ func (n *workNode) rebalance() {
 		// If root node is a branch and only has one node then collapse it.
 		if !n.isLeaf && len(n.inodes) == 1 {
 			// Move root's child up.
-			child := n.bucket.node(n.inodes[0].Nid(), n)
+			child := n.childAt(0)
 			n.isLeaf = child.isLeaf
 			n.inodes = child.inodes[:]
-			n.children = child.children
 
 			// Reparent all child nodes being moved.
 			for _, inode := range n.inodes {
-				if child, ok := n.bucket.dirty[inode.Nid()]; ok {
-					child.parent = n
+				if inode.child != nil && n.bucket.dirty[inode.child] {
+					inode.child.parent = n
 				}
 			}
 
-			// Remove old child.
+			// Detach old child.
 			child.parent = nil
-			n.bucket.dropNode(child.nid)
 		}
 
 		return
@@ -342,11 +328,7 @@ func (n *workNode) rebalance() {
 
 	// If node has no keys then just remove it.
 	if n.numChildren() == 0 {
-		oldID := n.nid
 		n.parent.del(n.key)
-		n.parent.removeChild(n)
-		n.bucket.dropNode(oldID)
-		n.nid = 0
 		n.parent.rebalance()
 		return
 	}
@@ -354,7 +336,7 @@ func (n *workNode) rebalance() {
 	common.Assert(n.parent.numChildren() > 1, "parent must have at least 2 children")
 
 	// Merge with right sibling if idx == 0, otherwise left sibling.
-	var leftNode, rightNode *workNode
+	var leftNode, rightNode *node
 	var useNextSibling = n.parent.childIndex(n) == 0
 	if useNextSibling {
 		leftNode = n
@@ -365,35 +347,17 @@ func (n *workNode) rebalance() {
 	}
 
 	// If both nodes are too small then merge them.
-	// Reparent all child nodes being moved.
-	oldRightID := rightNode.nid
+	// Reparent all child nodes being moved from right to left.
 	for _, inode := range rightNode.inodes {
-		if child, ok := n.bucket.dirty[inode.Nid()]; ok {
-			child.parent.removeChild(child)
-			child.parent = leftNode
-			child.parent.children = append(child.parent.children, child)
+		if inode.child != nil && rightNode.bucket.dirty[inode.child] {
+			inode.child.parent = leftNode
 		}
 	}
 
 	// Copy over inodes from right node to left node and remove right node.
 	leftNode.inodes = append(leftNode.inodes, rightNode.inodes...)
 	n.parent.del(rightNode.key)
-	n.parent.removeChild(rightNode)
-	n.bucket.dropNode(oldRightID)
-
-	// Either this node or the sibling node was deleted from the parent so rebalance it.
 	n.parent.rebalance()
-}
-
-// removes a node from the list of in-memory children.
-// This does not affect the inodes.
-func (n *workNode) removeChild(target *workNode) {
-	for i, child := range n.children {
-		if child == target {
-			n.children = append(n.children[:i], n.children[i+1:]...)
-			return
-		}
-	}
 }
 
 // dump writes the contents of the node to STDERR for debugging purposes.
@@ -404,29 +368,16 @@ func (n *node) dump() {
 	if n.isLeaf {
 		typ = "leaf"
 	}
-	warnf("[NODE %d {type=%s count=%d}]", n.nid, typ, len(n.inodes))
+	warnf("[NODE {type=%s count=%d}]", typ, len(n.inodes))
 
 	// Write out abbreviated version of each item.
 	for _, item := range n.inodes {
 		if n.isLeaf {
-			if item.flags&bucketLeafFlag != 0 {
-				bucket := (*bucket)(unsafe.Pointer(&item.value[0]))
-				warnf("+L %08x -> (bucket root=%d)", trunc(item.key, 4), bucket.root)
-			} else {
-				warnf("+L %08x -> %08x", trunc(item.key, 4), trunc(item.value, 4))
-			}
+			warnf("+L %08x -> %08x", trunc(item.key, 4), trunc(item.value, 4))
 		} else {
-			warnf("+B %08x -> nid=%d", trunc(item.key, 4), item.nid)
+			warnf("+B %08x -> child=%p", trunc(item.key, 4), item.child)
 		}
 	}
 	warn("")
 }
 */
-
-type workNodes []*workNode
-
-func (s workNodes) Len() int      { return len(s) }
-func (s workNodes) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
-func (s workNodes) Less(i, j int) bool {
-	return bytes.Compare(s[i].inodes[0].Key(), s[j].inodes[0].Key()) == -1
-}

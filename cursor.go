@@ -2,7 +2,6 @@ package vmbolt
 
 import (
 	"bytes"
-	"fmt"
 	"sort"
 
 	"github.com/13eholder/vmbolt/errors"
@@ -48,7 +47,7 @@ func (c *Cursor) First() (key []byte, value []byte) {
 
 func (c *Cursor) first() (key []byte, value []byte, flags uint32) {
 	c.stack = c.stack[:0]
-	n := c.bucket.pageNode(c.bucket.Root())
+	n := c.bucket.rootView()
 	c.stack = append(c.stack, elemRef{node: n, index: 0})
 	c.goToFirstElementOnTheStack()
 
@@ -71,7 +70,7 @@ func (c *Cursor) Last() (key []byte, value []byte) {
 	}
 	common.Assert(c.bucket.tx.db != nil, "tx closed")
 	c.stack = c.stack[:0]
-	n := c.bucket.pageNode(c.bucket.Root())
+	n := c.bucket.rootView()
 	ref := elemRef{node: n}
 	ref.index = ref.count() - 1
 	c.stack = append(c.stack, ref)
@@ -159,7 +158,7 @@ func (c *Cursor) dirKeyValue() ([]byte, []byte) {
 func (c *Cursor) seek(seek []byte) (key []byte, value []byte, flags uint32) {
 	// Start from root node and traverse to correct node.
 	c.stack = c.stack[:0]
-	c.search(seek, c.bucket.Root())
+	c.search(seek, c.bucket.rootView())
 	return c.keyValue()
 }
 
@@ -173,8 +172,7 @@ func (c *Cursor) goToFirstElementOnTheStack() {
 		}
 
 		// Keep adding nodes pointing to the first element to the stack.
-		nId := ref.node.inodes[ref.index].Nid()
-		n := c.bucket.pageNode(nId)
+		n := ref.node.inodes[ref.index].child
 		c.stack = append(c.stack, elemRef{node: n, index: 0})
 	}
 }
@@ -189,8 +187,7 @@ func (c *Cursor) last() {
 		}
 
 		// Keep adding nodes pointing to the last element in the stack.
-		nId := ref.node.inodes[ref.index].Nid()
-		n := c.bucket.pageNode(nId)
+		n := ref.node.inodes[ref.index].child
 
 		var nextRef = elemRef{node: n}
 		nextRef.index = nextRef.count() - 1
@@ -264,10 +261,9 @@ func (c *Cursor) prev() (key []byte, value []byte, flags uint32) {
 }
 
 // search recursively performs a binary search against a given node until it finds a given key.
-func (c *Cursor) search(key []byte, nId common.Nid) {
-	n := c.bucket.pageNode(nId)
+func (c *Cursor) search(key []byte, n *node) {
 	if n == nil {
-		panic(fmt.Sprintf("node %d not found", nId))
+		panic("cursor search: nil node")
 	}
 	e := elemRef{node: n}
 	c.stack = append(c.stack, e)
@@ -286,7 +282,7 @@ func (c *Cursor) searchNode(key []byte, n *node) {
 	index := sort.Search(len(n.inodes), func(i int) bool {
 		// TODO(benbjohnson): Optimize this range search. It's a bit hacky right now.
 		// sort.Search() finds the lowest index where f() != -1 but we need the highest index.
-		ret := bytes.Compare(n.inodes[i].Key(), key)
+		ret := bytes.Compare(n.inodes[i].key, key)
 		if ret == 0 {
 			exact = true
 		}
@@ -298,7 +294,7 @@ func (c *Cursor) searchNode(key []byte, n *node) {
 	c.stack[len(c.stack)-1].index = index
 
 	// Recursively search to the next node.
-	c.search(key, n.inodes[index].Nid())
+	c.search(key, n.inodes[index].child)
 }
 
 // nsearch searches the leaf node on the top of the stack for a key.
@@ -307,7 +303,7 @@ func (c *Cursor) nsearch(key []byte) {
 	n := e.node
 
 	index := sort.Search(len(n.inodes), func(i int) bool {
-		return bytes.Compare(n.inodes[i].Key(), key) != -1
+		return bytes.Compare(n.inodes[i].key, key) != -1
 	})
 	e.index = index
 }
@@ -323,15 +319,16 @@ func (c *Cursor) keyValue() ([]byte, []byte, uint32) {
 
 	// Retrieve value from node.
 	inode := &ref.node.inodes[ref.index]
-	return inode.Key(), inode.Value(), inode.Flags()
+	return inode.key, inode.value, inode.flags
 }
 
-// node returns the node that the cursor is currently positioned on.
-func (c *Cursor) node() *workNode {
+// node returns the (materialized, writable) leaf node that the cursor is currently
+// positioned on. It COWs the root-to-leaf path on the way down.
+func (c *Cursor) node() *node {
 	common.Assert(len(c.stack) > 0, "accessing a node with a zero-length cursor stack")
 
 	// Start from root and traverse down the hierarchy.
-	n := c.bucket.node(c.bucket.Root(), nil)
+	n := c.bucket.writableRoot()
 	for _, ref := range c.stack[:len(c.stack)-1] {
 		common.Assert(!n.isLeaf, "expected branch node")
 		n = n.childAt(ref.index)
