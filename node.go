@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	defaultMaxNodeSizeBytes  = 192 * 1024
+	defaultMaxNodeSizeBytes  = 128 * 1024
 	defaultMinNodeMergeBytes = defaultMaxNodeSizeBytes / 4
 	nodeHeaderOverheadBytes  = 32
 	nodeInodeOverheadBytes   = 24
@@ -134,8 +134,11 @@ func (n *node) del(key []byte) {
 		return
 	}
 
-	// Delete inode from the node.
-	n.inodes = append(n.inodes[:index], n.inodes[index+1:]...)
+	// Delete inode from the node and clear the tail slot so removed keys,
+	// values, or children do not remain reachable through the backing array.
+	copy(n.inodes[index:], n.inodes[index+1:])
+	n.inodes[len(n.inodes)-1] = inode{}
+	n.inodes = n.inodes[:len(n.inodes)-1]
 
 	// Mark the node as needing rebalancing.
 	n.unbalanced = true
@@ -167,9 +170,10 @@ func (n *node) split() []*node {
 // splitTwo breaks up a node into two smaller nodes, if appropriate.
 // This should only be called from the split() function.
 func (n *node) splitTwo() (*node, *node) {
-	// Ignore the split if the node doesn't have at least enough nodes for
-	// two nodes or if the nodes can fit in a single node.
-	if len(n.inodes) <= (minKeysPerNode*2) || n.sizeLessThan(defaultMaxNodeSizeBytes) {
+	// Ignore the split if the node doesn't have enough keys for two valid
+	// nodes or if the node can fit in a single node.
+	minKeys := n.minKeys()
+	if len(n.inodes) <= (minKeys*2) || n.sizeLessThan(defaultMaxNodeSizeBytes) {
 		return n, nil
 	}
 
@@ -196,9 +200,15 @@ func (n *node) splitTwo() (*node, *node) {
 	next := &node{bucket: n.bucket, isLeaf: n.isLeaf, parent: n.parent}
 	n.bucket.dirty[next] = true
 
-	// Split inodes across two nodes.
-	next.inodes = n.inodes[splitIndex:]
-	n.inodes = n.inodes[:splitIndex]
+	// Split inodes across two independent slices. Keeping the old backing array
+	// would retain references to large values from the other half of the split.
+	leftInodes := append([]inode(nil), n.inodes[:splitIndex]...)
+	rightInodes := append([]inode(nil), n.inodes[splitIndex:]...)
+	for i := range n.inodes {
+		n.inodes[i] = inode{}
+	}
+	n.inodes = leftInodes
+	next.inodes = rightInodes
 
 	// Update the statistics.
 	n.bucket.tx.stats.IncSplit(1)
@@ -213,14 +223,15 @@ func (n *node) splitIndex(threshold int) (index, sz int) {
 	sz = nodeHeaderOverheadBytes
 
 	// Loop until we only have the minimum number of keys required for the second node.
-	for i := 0; i < len(n.inodes)-minKeysPerNode; i++ {
+	minKeys := n.minKeys()
+	for i := 0; i < len(n.inodes)-minKeys; i++ {
 		index = i
 		inode := n.inodes[i]
 		elsize := nodeInodeOverheadBytes + len(inode.key) + len(inode.value)
 
 		// If we have at least the minimum number of keys and adding another
 		// node would put us over the threshold then exit and return.
-		if index >= minKeysPerNode && sz+elsize > threshold {
+		if index >= minKeys && sz+elsize > threshold {
 			break
 		}
 

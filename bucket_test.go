@@ -234,6 +234,30 @@ func TestBucket_Put_Closed(t *testing.T) {
 	}
 }
 
+// Ensure that a setting a value after the transaction has committed returns an error.
+func TestBucket_Put_ClosedAfterCommit(t *testing.T) {
+	db := btesting.MustCreateDB(t)
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := tx.CreateBucket([]byte("widgets"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Put([]byte("foo"), []byte("bar")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := b.Put([]byte("baz"), []byte("bat")); err != berrors.ErrTxClosed {
+		t.Fatalf("unexpected error: %s", err)
+	}
+}
+
 // Ensure that setting a value on a read-only bucket returns an error.
 func TestBucket_Put_ReadOnly(t *testing.T) {
 	db := btesting.MustCreateDB(t)
@@ -420,6 +444,31 @@ func TestBucket_Delete_Closed(t *testing.T) {
 	}
 }
 
+// Ensure that deleting a value after the transaction has committed returns an error.
+func TestBucket_Delete_ClosedAfterCommit(t *testing.T) {
+	db := btesting.MustCreateDB(t)
+
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := tx.CreateBucket([]byte("widgets"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Put([]byte("foo"), []byte("bar")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := b.Delete([]byte("foo")); err != berrors.ErrTxClosed {
+		t.Fatalf("unexpected error: %s", err)
+	}
+}
+
 // Ensure a database can stop iteration early.
 func TestBucket_ForEach_ShortCircuit(t *testing.T) {
 	db := btesting.MustCreateDB(t)
@@ -473,6 +522,31 @@ func TestBucket_ForEach_Closed(t *testing.T) {
 	}
 
 	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := b.ForEach(func(k, v []byte) error { return nil }); err != berrors.ErrTxClosed {
+		t.Fatalf("unexpected error: %s", err)
+	}
+}
+
+// Ensure that looping over a bucket after the transaction has committed returns an error.
+func TestBucket_ForEach_ClosedAfterCommit(t *testing.T) {
+	db := btesting.MustCreateDB(t)
+
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := tx.CreateBucket([]byte("widgets"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Put([]byte("foo"), []byte("bar")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 

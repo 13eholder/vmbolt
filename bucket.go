@@ -286,7 +286,21 @@ func (b *Bucket) publishRoot() *bucketState {
 	if b.rootNode == nil {
 		return b.baseState()
 	}
-	return &bucketState{root: b.rootNode}
+	root := b.rootNode
+	b.detachPublishedNodes()
+	return &bucketState{root: root}
+}
+
+// detachPublishedNodes removes tx-local back references from nodes that are
+// about to become part of the immutable published tree. The tree links are the
+// inode child pointers; bucket/parent are only needed while building a write tx.
+func (b *Bucket) detachPublishedNodes() {
+	for n := range b.dirty {
+		n.bucket = nil
+		n.parent = nil
+	}
+	b.rootNode = nil
+	b.dirty = nil
 }
 
 // size returns the logical payload size of the bucket's tx view in bytes.
