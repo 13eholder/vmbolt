@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	defaultMaxNodeSizeBytes  = 128 * 1024
+	defaultMaxNodeSizeBytes  = 192 * 1024
 	defaultMinNodeMergeBytes = defaultMaxNodeSizeBytes / 4
 	nodeHeaderOverheadBytes  = 32
 	nodeInodeOverheadBytes   = 24
